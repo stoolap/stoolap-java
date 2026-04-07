@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            lib_file: libstoolap_jni.dylib
+            resource_dir: darwin-aarch64
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib_file: libstoolap_jni.so
+            resource_dir: linux-x86_64
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            lib_file: stoolap_jni.dll
+            resource_dir: windows-x86_64
+
+    name: Build - ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: jni
+          key: ${{ matrix.settings.target }}
+
+      - name: Build stoolap-jni
+        working-directory: jni
+        run: cargo build --release --target ${{ matrix.settings.target }}
+
+      - name: Strip shared library (macOS)
+        if: runner.os == 'macOS'
+        run: strip -x jni/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+
+      - name: Strip shared library (Linux)
+        if: runner.os == 'Linux'
+        run: strip jni/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.settings.resource_dir }}
+          path: jni/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+          if-no-files-found: error
+
+  test:
+    name: Test - Java ${{ matrix.java }} (${{ matrix.settings.os }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - os: macos-latest
+            artifact: native-darwin-aarch64
+            lib_file: libstoolap_jni.dylib
+          - os: ubuntu-latest
+            artifact: native-linux-x86_64
+            lib_file: libstoolap_jni.so
+          - os: windows-latest
+            artifact: native-windows-x86_64
+            lib_file: stoolap_jni.dll
+        java: ['17', '21', '25']
+    runs-on: ${{ matrix.settings.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Download native library
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.settings.artifact }}
+          path: native-lib
+
+      - name: Run tests
+        shell: bash
+        env:
+          STOOLAP_LIB: ${{ github.workspace }}/native-lib/${{ matrix.settings.lib_file }}
+        run: mvn -B test
+
+  format:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check Rust formatting
+        working-directory: jni
+        run: cargo fmt --check
+
+      - name: Run clippy
+        working-directory: jni
+        run: cargo clippy --release -- -D warnings
+        continue-on-error: true
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install google-java-format
+        run: |
+          curl -sL -o google-java-format.jar \
+            https://github.com/google/google-java-format/releases/download/v1.22.0/google-java-format-1.22.0-all-deps.jar
+
+      - name: Check Java formatting
+        run: |
+          find src -name "*.java" -print0 | xargs -0 java -jar google-java-format.jar --dry-run --set-exit-if-changed

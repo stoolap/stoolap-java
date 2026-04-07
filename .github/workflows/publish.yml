@@ -1,0 +1,200 @@
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        settings:
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            lib_file: libstoolap_jni.dylib
+            resource_dir: darwin-aarch64
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            lib_file: libstoolap_jni.dylib
+            resource_dir: darwin-x86_64
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib_file: libstoolap_jni.so
+            resource_dir: linux-x86_64
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            lib_file: libstoolap_jni.so
+            resource_dir: linux-aarch64
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            lib_file: stoolap_jni.dll
+            resource_dir: windows-x86_64
+
+    name: Build - ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Install cross-compilation tools (aarch64-linux)
+        if: matrix.settings.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: jni
+          key: ${{ matrix.settings.target }}
+
+      - name: Build stoolap-jni
+        working-directory: jni
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.settings.target }}
+
+      - name: Strip shared library (macOS)
+        if: runner.os == 'macOS'
+        run: strip -x jni/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+
+      - name: Strip shared library (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [[ "${{ matrix.settings.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            aarch64-linux-gnu-strip jni/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+          else
+            strip jni/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+          fi
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.settings.resource_dir }}
+          path: jni/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+          if-no-files-found: error
+
+  test:
+    name: Test - Java ${{ matrix.java }} (${{ matrix.settings.os }})
+    needs: build
+    strategy:
+      fail-fast: true
+      matrix:
+        settings:
+          - os: macos-latest
+            artifact: native-darwin-aarch64
+            lib_file: libstoolap_jni.dylib
+          - os: ubuntu-latest
+            artifact: native-linux-x86_64
+            lib_file: libstoolap_jni.so
+          - os: windows-latest
+            artifact: native-windows-x86_64
+            lib_file: stoolap_jni.dll
+        java: ['17', '21', '25']
+    runs-on: ${{ matrix.settings.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Download native library
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.settings.artifact }}
+          path: native-lib
+
+      - name: Run tests
+        shell: bash
+        env:
+          STOOLAP_LIB: ${{ github.workspace }}/native-lib/${{ matrix.settings.lib_file }}
+        run: mvn -B test
+
+  publish:
+    name: Publish to Maven Central
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    environment: maven-central
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: maven
+          server-id: central
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Update pom.xml version
+        run: mvn -B versions:set -DnewVersion=${{ steps.version.outputs.VERSION }} -DgenerateBackupPoms=false
+
+      - name: Download all native libraries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Bundle native libraries into JAR resources
+        run: |
+          mkdir -p src/main/resources/native
+          for dir in darwin-aarch64 darwin-x86_64 linux-x86_64 linux-aarch64 windows-x86_64; do
+            mkdir -p src/main/resources/native/$dir
+            cp artifacts/native-$dir/* src/main/resources/native/$dir/
+          done
+          echo "Bundled native libraries:"
+          find src/main/resources/native -type f
+
+      - name: Build, sign, and deploy
+        env:
+          MAVEN_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: mvn -B -P release deploy
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          declare -A NAMES=(
+            ["darwin-aarch64"]="libstoolap_jni-darwin-arm64.dylib"
+            ["darwin-x86_64"]="libstoolap_jni-darwin-x64.dylib"
+            ["linux-x86_64"]="libstoolap_jni-linux-x64.so"
+            ["linux-aarch64"]="libstoolap_jni-linux-arm64.so"
+            ["windows-x86_64"]="stoolap_jni-windows-x64.dll"
+          )
+          for target in "${!NAMES[@]}"; do
+            src=$(ls artifacts/native-${target}/*)
+            dest="release/${NAMES[$target]}"
+            cp "$src" "$dest"
+          done
+          # JAR artifacts
+          cp target/stoolap-java-${{ steps.version.outputs.VERSION }}.jar release/ || true
+          cp target/stoolap-java-${{ steps.version.outputs.VERSION }}-sources.jar release/ || true
+          cp target/stoolap-java-${{ steps.version.outputs.VERSION }}-javadoc.jar release/ || true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          generate_release_notes: true
+          files: release/*

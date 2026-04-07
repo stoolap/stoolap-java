@@ -1,0 +1,46 @@
+# Maven
+target/
+*.class
+*.jar
+*.war
+*.ear
+.mvn/wrapper/maven-wrapper.jar
+.mvn/wrapper/maven-wrapper.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+release.properties
+
+# Cargo / Rust
+jni/target/
+jni/Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Native libraries (built locally)
+*.dylib
+*.so
+*.dll
+!src/main/resources/native/**/*.dylib
+!src/main/resources/native/**/*.so
+!src/main/resources/native/**/*.dll
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.project
+.classpath
+.settings/
+.factorypath
+*.swp
+.DS_Store
+
+# Logs
+*.log
+hs_err_pid*.log
+replay_pid*.log
+
+# OS
+Thumbs.db
