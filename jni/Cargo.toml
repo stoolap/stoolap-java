@@ -1,6 +1,6 @@
 [package]
 name = "stoolap-jni"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 publish = false
 
@@ -9,5 +9,5 @@ name = "stoolap_jni"
 crate-type = ["cdylib"]
 
 [dependencies]
-stoolap = "0.4.0"
+stoolap = "0.4.1"
 jni = "0.21"

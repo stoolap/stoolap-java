@@ -44,7 +44,7 @@ public class StoolapDatabaseMetaData implements DatabaseMetaData {
 
   @Override
   public String getDriverVersion() throws SQLException {
-    return "0.4.0";
+    return "0.4.1";
   }
 
   @Override
