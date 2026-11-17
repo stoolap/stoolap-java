@@ -16,66 +16,85 @@
 package io.stoolap.internal;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.Arrays;
+import java.util.Map;
 
 /**
  * Encodes Java parameters into a packed binary format for zero-overhead JNI crossing.
  *
- * <p>Wire format for single row:
+ * <p>Wire format for one parameter set:
  *
  * <pre>
- * [param_count: u32 LE]
- * [for each param: type_tag:u8 + payload]
+ * [count: u32 LE]                       bit 31 set = named parameters
+ * positional: [for each: value]
+ * named:      [for each: name_len:u32 LE, name:utf8, value]
  * </pre>
  *
- * <p>Wire format for batch:
+ * <p>Wire format for a batch: {@code [row_count: u32 LE]} followed by one parameter set per row.
  *
- * <pre>
- * [row_count: u32 LE]
- * [param_count: u32 LE]
- * [for each row, for each param: type_tag:u8 + payload]
- * </pre>
+ * <p>A value is {@code type_tag:u8 + payload}: NULL=0, INTEGER=1 (i64), FLOAT=2 (f64), TEXT=3
+ * (len:u32 + utf8), BOOLEAN=4 (u8), TIMESTAMP=5 (i64 nanos since the epoch), JSON=6 (len:u32 +
+ * utf8), VECTOR=7 (count:u32 + f32 LE each).
  *
- * <p>Type tags match BulkDecoder: NULL=0, INTEGER=1, FLOAT=2, TEXT=3, BOOLEAN=4.
+ * <p>Java types: {@link Long}, {@link Integer}, {@link Short}, {@link Byte} bind as INTEGER;
+ * {@link Double}, {@link Float} as FLOAT; {@link String} as TEXT; {@link Boolean} as BOOLEAN;
+ * {@link Instant}, {@link java.sql.Timestamp}, {@link OffsetDateTime}, {@link ZonedDateTime} and
+ * {@link LocalDateTime} (read as UTC) as TIMESTAMP; {@code float[]} as VECTOR. A {@code byte[]} is
+ * refused, since Stoolap has no BLOB type. Any other object binds as its {@code toString()} text.
  */
 public final class ParamEncoder {
+
+  private static final int NAMED_FLAG = 1 << 31;
 
   /** Thread-local buffer state to avoid per-call allocation. */
   private static final ThreadLocal<Buf> TL = ThreadLocal.withInitial(Buf::new);
 
   private ParamEncoder() {}
 
+  /** Encodes positional parameters; {@code null} means none. */
   public static byte[] encode(Object[] params) {
     Buf b = TL.get();
     b.reset();
-    int count = params != null ? params.length : 0;
-    b.writeInt(count);
-    for (int i = 0; i < count; i++) {
-      b.writeValue(params[i]);
+    b.writePositional(params);
+    return b.toArray();
+  }
+
+  /** Encodes named parameters. A leading {@code :}, {@code @} or {@code $} on a name is ignored. */
+  public static byte[] encode(Map<String, ?> params) {
+    Buf b = TL.get();
+    b.reset();
+    b.writeNamed(params);
+    return b.toArray();
+  }
+
+  /** Encodes a batch of positional parameter sets. */
+  public static byte[] encodeBatch(Object[][] batch) {
+    Buf b = TL.get();
+    b.reset();
+    int rows = batch != null ? batch.length : 0;
+    b.writeInt(rows);
+    for (int r = 0; r < rows; r++) {
+      b.writePositional(batch[r]);
     }
     return b.toArray();
   }
 
-  public static byte[] encodeBatch(Object[][] batch) {
-    Buf b = TL.get();
-    b.reset();
-    if (batch == null || batch.length == 0) {
-      b.writeInt(0);
-      b.writeInt(0);
-      return b.toArray();
+  /** Nanoseconds since the epoch, refusing an instant outside the range a TIMESTAMP holds. */
+  static long epochNanos(Instant t) {
+    try {
+      return Math.addExact(Math.multiplyExact(t.getEpochSecond(), 1_000_000_000L), t.getNano());
+    } catch (ArithmeticException e) {
+      throw new IllegalArgumentException(
+          "TIMESTAMP "
+              + t
+              + " is outside the range 1677-09-21T00:12:43.145224192Z to"
+              + " 2262-04-11T23:47:16.854775807Z");
     }
-    int rowCount = batch.length;
-    int paramCount = batch[0] != null ? batch[0].length : 0;
-    b.writeInt(rowCount);
-    b.writeInt(paramCount);
-    for (Object[] row : batch) {
-      if (row != null) {
-        for (int i = 0; i < paramCount; i++) {
-          b.writeValue(i < row.length ? row[i] : null);
-        }
-      }
-    }
-    return b.toArray();
   }
 
   /** Mutable growing byte buffer, little-endian. */
@@ -84,6 +103,7 @@ public final class ParamEncoder {
     int pos = 0;
 
     void reset() {
+      if (data.length > 1 << 20) data = new byte[256];
       pos = 0;
     }
 
@@ -129,11 +149,32 @@ public final class ParamEncoder {
       pos += b.length;
     }
 
-    void writeString(String s) {
+    void writeUtf8(String s) {
       byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
-      writeByte((byte) 3);
       writeInt(bytes.length);
       writeBytes(bytes);
+    }
+
+    void writeTimestamp(Instant t) {
+      writeByte((byte) 5);
+      writeLong(epochNanos(t));
+    }
+
+    void writePositional(Object[] params) {
+      int count = params != null ? params.length : 0;
+      writeInt(count);
+      for (int i = 0; i < count; i++) {
+        writeValue(params[i]);
+      }
+    }
+
+    void writeNamed(Map<String, ?> params) {
+      writeInt(params.size() | NAMED_FLAG);
+      for (Map.Entry<String, ?> e : params.entrySet()) {
+        if (e.getKey() == null) throw new IllegalArgumentException("parameter name is null");
+        writeUtf8(e.getKey());
+        writeValue(e.getValue());
+      }
     }
 
     void writeValue(Object val) {
@@ -152,7 +193,8 @@ public final class ParamEncoder {
         writeByte((byte) 2);
         writeDouble(v.doubleValue());
       } else if (val instanceof String v) {
-        writeString(v);
+        writeByte((byte) 3);
+        writeUtf8(v);
       } else if (val instanceof Boolean v) {
         writeByte((byte) 4);
         writeByte(v ? (byte) 1 : (byte) 0);
@@ -162,8 +204,33 @@ public final class ParamEncoder {
       } else if (val instanceof Byte v) {
         writeByte((byte) 1);
         writeLong(v.longValue());
+      } else if (val instanceof java.sql.Timestamp v) {
+        writeTimestamp(v.toInstant());
+      } else if (val instanceof Instant v) {
+        writeTimestamp(v);
+      } else if (val instanceof OffsetDateTime v) {
+        writeTimestamp(v.toInstant());
+      } else if (val instanceof ZonedDateTime v) {
+        writeTimestamp(v.toInstant());
+      } else if (val instanceof LocalDateTime v) {
+        writeTimestamp(v.toInstant(ZoneOffset.UTC));
+      } else if (val instanceof float[] v) {
+        writeByte((byte) 7);
+        writeInt(v.length);
+        ensure(v.length * 4);
+        for (float f : v) {
+          int bits = Float.floatToRawIntBits(f);
+          data[pos++] = (byte) bits;
+          data[pos++] = (byte) (bits >>> 8);
+          data[pos++] = (byte) (bits >>> 16);
+          data[pos++] = (byte) (bits >>> 24);
+        }
+      } else if (val instanceof byte[]) {
+        throw new IllegalArgumentException(
+            "byte[] parameters are not supported: Stoolap has no BLOB type");
       } else {
-        writeString(val.toString());
+        writeByte((byte) 3);
+        writeUtf8(val.toString());
       }
     }
 

@@ -15,237 +15,427 @@
 //! JNI bindings for the Stoolap database engine.
 //!
 //! Calls `stoolap::api` directly (no C FFI layer). Each Java handle is a
-//! `Box`-ed Rust object stored as a `jlong` pointer. Bulk row encoding is done
-//! entirely in Rust and returned as a `DirectByteBuffer` (zero-copy).
+//! `Box`-ed Rust object stored as a `jlong` pointer. Results are packed in
+//! Rust into one `byte[]` per call (see `BulkDecoder.java`), and parameters
+//! arrive packed the same way (see `ParamEncoder.java`).
 
+use std::cell::RefCell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+use chrono::{DateTime, Utc};
 use jni::objects::{JByteArray, JClass, JLongArray, JObject, JString};
 use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
-use stoolap::api::{Database, Rows, Transaction as ApiTransaction};
-use stoolap::executor::CachedPlanRef;
+use stoolap::api::{
+    Database, NamedParams, ParamVec, Rows, Statement, Transaction as ApiTransaction,
+};
 use stoolap::{DataType, IsolationLevel, Value};
 
-/// Our prepared statement: bundles the cached plan with a database clone
-/// so we can execute directly without SQL parsing or cache lookups.
+/// A prepared statement with a database clone that keeps its engine open
+/// for as long as the statement lives.
 pub struct PreparedStmt {
-    plan: CachedPlanRef,
-    db: Database,
+    stmt: Statement,
+    _db: Database,
 }
 
+/// A result read in chunks. `rows` is `None` once the result is exhausted.
+pub struct Cursor {
+    rows: Option<Rows>,
+    columns: Vec<String>,
+}
+
+type R<T> = Result<T, String>;
+
 // ============================================================
-// Helpers
+// Error plumbing
 // ============================================================
 
-/// Throw a Java SQLException and return `default`.
-fn throw_sql<T>(env: &mut JNIEnv, msg: &str, default: T) -> T {
-    let _ = env.throw_new("java/sql/SQLException", msg);
+/// Runs `f`, turning an `Err` or a panic into a Java `SQLException` and
+/// returning `default` in its place. A panic must never unwind into the JVM.
+fn run<'a, T>(env: &mut JNIEnv<'a>, default: T, f: impl FnOnce(&mut JNIEnv<'a>) -> R<T>) -> T {
+    let msg = match catch_unwind(AssertUnwindSafe(|| f(env))) {
+        Ok(Ok(v)) => return v,
+        Ok(Err(msg)) => msg,
+        Err(_) => "internal error: the native driver panicked".to_string(),
+    };
+    if !env.exception_check().unwrap_or(false) {
+        let _ = env.throw_new("java/sql/SQLException", msg);
+    }
     default
 }
 
-/// Convert a jlong back to a Box<T> reference (borrow, not consume).
-unsafe fn as_ref<'a, T>(ptr: jlong) -> &'a T {
-    unsafe { &*(ptr as *const T) }
+fn err(e: impl ToString) -> String {
+    e.to_string()
 }
 
-/// Convert a jlong back to a mutable Box<T> reference (borrow, not consume).
-unsafe fn as_mut<'a, T>(ptr: jlong) -> &'a mut T {
-    unsafe { &mut *(ptr as *mut T) }
-}
-
-/// Decode binary-encoded params from Java ParamEncoder format.
-/// Format: [param_count: u32 LE] [for each: type_tag:u8 + payload]
-fn decode_binary_params(data: &[u8]) -> Vec<Value> {
-    if data.len() < 4 {
-        return Vec::new();
+/// Borrows the object behind a handle, refusing a closed (zero) handle.
+unsafe fn handle<'h, T>(ptr: jlong, what: &str) -> R<&'h T> {
+    if ptr == 0 {
+        return Err(format!("{what} is closed"));
     }
-    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut values = Vec::with_capacity(count);
-    let mut pos = 4;
-    for _ in 0..count {
-        if pos >= data.len() {
-            break;
+    Ok(unsafe { &*(ptr as *const T) })
+}
+
+/// Mutably borrows the object behind a handle, refusing a closed handle.
+unsafe fn handle_mut<'h, T>(ptr: jlong, what: &str) -> R<&'h mut T> {
+    if ptr == 0 {
+        return Err(format!("{what} is closed"));
+    }
+    Ok(unsafe { &mut *(ptr as *mut T) })
+}
+
+fn into_handle<T>(v: T) -> jlong {
+    Box::into_raw(Box::new(v)) as jlong
+}
+
+/// Drops the object behind a handle; a zero handle is ignored.
+unsafe fn drop_handle<T>(ptr: jlong) {
+    if ptr != 0 {
+        drop(unsafe { Box::from_raw(ptr as *mut T) });
+    }
+}
+
+fn jstring(env: &mut JNIEnv, s: &JString) -> R<String> {
+    if s.is_null() {
+        return Err("SQL must not be null".into());
+    }
+    env.get_string(s).map(Into::into).map_err(err)
+}
+
+// ============================================================
+// Parameters
+// ============================================================
+
+/// Set in the leading count when the parameters are named.
+const NAMED_FLAG: u32 = 1 << 31;
+
+enum Params {
+    Positional(ParamVec),
+    Named(NamedParams),
+}
+
+impl Params {
+    fn none() -> Self {
+        Params::Positional(ParamVec::new())
+    }
+}
+
+/// Reads the packed parameter format of `ParamEncoder.java`.
+struct Reader<'b> {
+    data: &'b [u8],
+    pos: usize,
+}
+
+impl<'b> Reader<'b> {
+    fn new(data: &'b [u8]) -> Self {
+        Reader { data, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> R<&'b [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.data.len())
+            .ok_or("truncated parameter buffer")?;
+        let bytes = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn u8(&mut self) -> R<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> R<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn i64(&mut self) -> R<i64> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn str(&mut self) -> R<&'b str> {
+        let len = self.u32()? as usize;
+        std::str::from_utf8(self.take(len)?).map_err(|_| "parameter text is not valid UTF-8".into())
+    }
+
+    fn value(&mut self) -> R<Value> {
+        Ok(match self.u8()? {
+            0 => Value::Null(DataType::Null),
+            1 => Value::Integer(self.i64()?),
+            2 => Value::Float(f64::from_bits(self.i64()? as u64)),
+            3 => Value::text(self.str()?),
+            4 => Value::Boolean(self.u8()? != 0),
+            5 => Value::Timestamp(DateTime::<Utc>::from_timestamp_nanos(self.i64()?)),
+            6 => Value::json(self.str()?),
+            7 => {
+                let count = self.u32()? as usize;
+                let bytes = self.take(count.checked_mul(4).ok_or("vector too large")?)?;
+                Value::vector(
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
+                        .collect(),
+                )
+            }
+            tag => return Err(format!("unknown parameter type tag {tag}")),
+        })
+    }
+
+    fn params(&mut self) -> R<Params> {
+        let head = self.u32()?;
+        let count = (head & !NAMED_FLAG) as usize;
+        if head & NAMED_FLAG == 0 {
+            let mut values = ParamVec::with_capacity(count);
+            for _ in 0..count {
+                values.push(self.value()?);
+            }
+            return Ok(Params::Positional(values));
         }
-        let tag = data[pos];
-        pos += 1;
-        match tag {
-            0 => values.push(Value::Null(DataType::Text)),
-            1 => {
-                let v = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                pos += 8;
-                values.push(Value::Integer(v));
-            }
-            2 => {
-                let v = f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                pos += 8;
-                values.push(Value::Float(v));
-            }
-            3 => {
-                let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
-                let s = std::str::from_utf8(&data[pos..pos + len])
-                    .unwrap_or("")
-                    .to_string();
-                pos += len;
-                values.push(Value::Text(s.into()));
-            }
-            4 => {
-                let v = data[pos] != 0;
-                pos += 1;
-                values.push(Value::Boolean(v));
-            }
-            _ => values.push(Value::Null(DataType::Text)),
+        let mut named = NamedParams::with_capacity(count);
+        for _ in 0..count {
+            let name = self.str()?.trim_start_matches([':', '@', '$']).to_string();
+            let value = self.value()?;
+            named.insert(name, value);
+        }
+        Ok(Params::Named(named))
+    }
+
+    fn finish(&self) -> R<()> {
+        match self.pos == self.data.len() {
+            true => Ok(()),
+            false => Err("trailing bytes after parameters".into()),
         }
     }
-    values
 }
 
-/// Decode batch binary params. Format: [row_count:u32][param_count:u32][rows...]
-fn decode_binary_batch(data: &[u8]) -> Vec<Vec<Value>> {
-    if data.len() < 8 {
-        return Vec::new();
+/// Decodes one parameter set; a null array means no parameters.
+fn params(env: &mut JNIEnv, bin: &JByteArray) -> R<Params> {
+    if bin.is_null() {
+        return Ok(Params::none());
     }
-    let row_count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    let param_count = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-    let mut rows = Vec::with_capacity(row_count);
-    let mut pos = 8;
-    for _ in 0..row_count {
-        let mut values = Vec::with_capacity(param_count);
-        for _ in 0..param_count {
-            if pos >= data.len() {
-                break;
-            }
-            let tag = data[pos];
-            pos += 1;
-            match tag {
-                0 => values.push(Value::Null(DataType::Text)),
-                1 => {
-                    let v = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                    pos += 8;
-                    values.push(Value::Integer(v));
-                }
-                2 => {
-                    let v = f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                    pos += 8;
-                    values.push(Value::Float(v));
-                }
-                3 => {
-                    let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                    pos += 4;
-                    let s = std::str::from_utf8(&data[pos..pos + len])
-                        .unwrap_or("")
-                        .to_string();
-                    pos += len;
-                    values.push(Value::Text(s.into()));
-                }
-                4 => {
-                    let v = data[pos] != 0;
-                    pos += 1;
-                    values.push(Value::Boolean(v));
-                }
-                _ => values.push(Value::Null(DataType::Text)),
-            }
+    let bytes = env.convert_byte_array(bin).map_err(err)?;
+    let mut r = Reader::new(&bytes);
+    let p = r.params()?;
+    r.finish()?;
+    Ok(p)
+}
+
+/// Decodes a batch: `[row_count:u32]` followed by one parameter set per row.
+fn batch(env: &mut JNIEnv, bin: &JByteArray) -> R<Vec<Params>> {
+    if bin.is_null() {
+        return Err("batch must not be null".into());
+    }
+    let bytes = env.convert_byte_array(bin).map_err(err)?;
+    let mut r = Reader::new(&bytes);
+    let rows = r.u32()? as usize;
+    let mut all = Vec::with_capacity(rows.min(bytes.len()));
+    for _ in 0..rows {
+        all.push(r.params()?);
+    }
+    r.finish()?;
+    Ok(all)
+}
+
+// ============================================================
+// Running statements
+// ============================================================
+
+fn db_exec(db: &Database, sql: &str, p: Params) -> stoolap::Result<i64> {
+    match p {
+        Params::Positional(v) => db.execute(sql, v),
+        Params::Named(n) => db.execute_named(sql, n),
+    }
+}
+
+fn db_query(db: &Database, sql: &str, p: Params) -> stoolap::Result<Rows> {
+    match p {
+        Params::Positional(v) => db.query(sql, v),
+        Params::Named(n) => db.query_named(sql, n),
+    }
+}
+
+fn tx_exec(tx: &mut ApiTransaction, sql: &str, p: Params) -> stoolap::Result<i64> {
+    match p {
+        Params::Positional(v) => tx.execute(sql, v),
+        Params::Named(n) => tx.execute_named(sql, n),
+    }
+}
+
+fn tx_query(tx: &mut ApiTransaction, sql: &str, p: Params) -> stoolap::Result<Rows> {
+    match p {
+        Params::Positional(v) => tx.query(sql, v),
+        Params::Named(n) => tx.query_named(sql, n),
+    }
+}
+
+fn stmt_exec(s: &Statement, tx: Option<&mut ApiTransaction>, p: Params) -> stoolap::Result<i64> {
+    match (tx, p) {
+        (None, Params::Positional(v)) => s.execute(v),
+        (None, Params::Named(n)) => s.execute_named(n),
+        (Some(tx), Params::Positional(v)) => s.execute_in(tx, v),
+        (Some(tx), Params::Named(n)) => s.execute_named_in(tx, n),
+    }
+}
+
+fn stmt_query(s: &Statement, tx: Option<&mut ApiTransaction>, p: Params) -> stoolap::Result<Rows> {
+    match (tx, p) {
+        (None, Params::Positional(v)) => s.query(v),
+        (None, Params::Named(n)) => s.query_named(n),
+        (Some(tx), Params::Positional(v)) => s.query_in(tx, v),
+        (Some(tx), Params::Named(n)) => s.query_named_in(tx, n),
+    }
+}
+
+/// Runs every parameter set of a batch through `s` inside `tx`, naming the
+/// failing row in the error.
+fn stmt_batch(s: &Statement, tx: &mut ApiTransaction, all: Vec<Params>) -> R<Vec<i64>> {
+    let mut counts = Vec::with_capacity(all.len());
+    for (i, p) in all.into_iter().enumerate() {
+        counts.push(stmt_exec(s, Some(tx), p).map_err(|e| format!("batch row {i}: {e}"))?);
+    }
+    Ok(counts)
+}
+
+fn long_array<'a>(env: &mut JNIEnv<'a>, values: &[i64]) -> R<JLongArray<'a>> {
+    let arr = env.new_long_array(values.len() as i32).map_err(err)?;
+    env.set_long_array_region(&arr, 0, values).map_err(err)?;
+    Ok(arr)
+}
+
+// ============================================================
+// Packed results
+// ============================================================
+
+/// Largest packed buffer a thread keeps between calls.
+const PACKED_KEEP_MAX: usize = 1 << 20;
+
+thread_local! {
+    static PACKED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Writes the column count and names and a zero row count, returning the
+/// offset of the row count for `write_rows` to patch.
+fn write_header(columns: &[String], buf: &mut Vec<u8>) -> R<usize> {
+    buf.extend_from_slice(&(columns.len() as u32).to_le_bytes());
+    for name in columns {
+        let len = u16::try_from(name.len()).map_err(|_| {
+            format!(
+                "a result column name takes {} bytes, more than the {} the packed format \
+                 carries; give the column an alias",
+                name.len(),
+                u16::MAX
+            )
+        })?;
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+    }
+    let count_at = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    Ok(count_at)
+}
+
+fn write_bytes(tag: u8, bytes: &[u8], buf: &mut Vec<u8>) {
+    buf.push(tag);
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn write_value(val: &Value, buf: &mut Vec<u8>) -> R<()> {
+    match val {
+        Value::Null(_) => buf.push(0),
+        Value::Integer(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_le_bytes());
         }
-        rows.push(values);
+        Value::Float(v) => {
+            buf.push(2);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::Text(s) => write_bytes(3, s.as_bytes(), buf),
+        Value::Boolean(v) => {
+            buf.push(4);
+            buf.push(*v as u8);
+        }
+        Value::Timestamp(ts) => {
+            let nanos = ts.timestamp_nanos_opt().ok_or_else(|| {
+                format!(
+                    "TIMESTAMP {ts} is outside the range 1677-09-21 00:12:43.145224192 to \
+                     2262-04-11 23:47:16.854775807"
+                )
+            })?;
+            buf.push(5);
+            buf.extend_from_slice(&nanos.to_le_bytes());
+        }
+        Value::Extension(data) => match data.first() {
+            None => buf.push(0),
+            Some(&t) if t == DataType::Json as u8 => write_bytes(6, &data[1..], buf),
+            Some(&t) if t == DataType::Vector as u8 => write_bytes(7, &data[1..], buf),
+            Some(&t) => return Err(format!("unsupported result value type {t}")),
+        },
     }
-    rows
+    Ok(())
 }
 
-/// Get byte[] from JNI and decode params.
-fn get_binary_params(env: &mut JNIEnv, bin: &JByteArray) -> Vec<Value> {
-    match env.convert_byte_array(bin) {
-        Ok(bytes) => decode_binary_params(&bytes),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Encode all rows from a Rows iterator into the packed binary format.
-/// Same wire format as stoolap_rows_fetch_all (see BulkDecoder.java).
-fn encode_rows(rows: &mut Rows) -> Vec<u8> {
-    let columns = rows.columns().to_vec();
-    let col_count = columns.len();
-
-    // Collect all rows first (we need row count upfront)
-    let mut all_rows: Vec<Vec<Value>> = Vec::new();
-    while rows.advance() {
+/// Packs up to `max_rows` rows and patches the row count. Returns the
+/// number of rows packed. A runtime error that ends the result early is
+/// returned, never a partial result.
+fn write_rows(rows: &mut Rows, max_rows: usize, count_at: usize, buf: &mut Vec<u8>) -> R<usize> {
+    let col_count = rows.columns().len();
+    let mut n = 0usize;
+    while n < max_rows && rows.advance() {
         let row = rows.current_row();
-        let mut values = Vec::with_capacity(col_count);
         for i in 0..col_count {
             match row.get(i) {
-                Some(v) => values.push(v.clone()),
-                None => values.push(Value::Null(DataType::Text)),
+                Some(v) => write_value(v, buf)?,
+                None => buf.push(0),
             }
         }
-        all_rows.push(values);
+        n += 1;
     }
-
-    // Estimate capacity
-    let mut buf = Vec::with_capacity(4 + col_count * 32 + 4 + all_rows.len() * col_count * 16);
-
-    // Column count (u32 LE)
-    buf.extend_from_slice(&(col_count as u32).to_le_bytes());
-
-    // Column names
-    for name in &columns {
-        let name_bytes = name.as_bytes();
-        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-        buf.extend_from_slice(name_bytes);
-    }
-
-    // Row count (u32 LE)
-    buf.extend_from_slice(&(all_rows.len() as u32).to_le_bytes());
-
-    // Row data
-    for row_values in &all_rows {
-        for val in row_values {
-            match val {
-                Value::Null(_) => buf.push(0),
-                Value::Integer(v) => {
-                    buf.push(1);
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-                Value::Float(v) => {
-                    buf.push(2);
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-                Value::Text(s) => {
-                    buf.push(3);
-                    let bytes = s.as_bytes();
-                    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(bytes);
-                }
-                Value::Boolean(v) => {
-                    buf.push(4);
-                    buf.push(if *v { 1 } else { 0 });
-                }
-                Value::Timestamp(ts) => {
-                    buf.push(5);
-                    let nanos = ts.timestamp_nanos_opt().unwrap_or(0);
-                    buf.extend_from_slice(&nanos.to_le_bytes());
-                }
-                Value::Extension(ext) => {
-                    let bytes = ext.as_ref();
-                    if bytes.is_empty() {
-                        buf.push(0); // null
-                    } else {
-                        let tag = bytes[0];
-                        let payload = &bytes[1..];
-                        // tag 6 = JSON (DataType::Json = 6), else blob
-                        if tag == 6 {
-                            buf.push(6); // JSON
-                            buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                            buf.extend_from_slice(payload);
-                        } else {
-                            buf.push(7); // BLOB
-                            buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                            buf.extend_from_slice(payload);
-                        }
-                    }
-                }
-            }
+    if n < max_rows {
+        if let Some(e) = rows.error() {
+            return Err(e.to_string());
         }
     }
-    buf
+    let count = u32::try_from(n).map_err(|_| "result has more than 4294967295 rows")?;
+    buf[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
+    Ok(n)
+}
+
+/// Packs into this thread's reusable buffer and copies it into a `byte[]`.
+fn packed<'a>(env: &mut JNIEnv<'a>, fill: impl FnOnce(&mut Vec<u8>) -> R<()>) -> R<JByteArray<'a>> {
+    PACKED.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.capacity() > PACKED_KEEP_MAX {
+            *buf = Vec::new();
+        }
+        buf.clear();
+        fill(&mut buf)?;
+        env.byte_array_from_slice(&buf).map_err(err)
+    })
+}
+
+/// Packs a whole query result.
+fn pack_all<'a>(env: &mut JNIEnv<'a>, rows: stoolap::Result<Rows>) -> R<JByteArray<'a>> {
+    let mut rows = rows.map_err(err)?;
+    packed(env, |buf| {
+        let count_at = write_header(rows.columns(), buf)?;
+        write_rows(&mut rows, usize::MAX, count_at, buf)?;
+        Ok(())
+    })
+}
+
+fn open_cursor(rows: stoolap::Result<Rows>) -> R<jlong> {
+    let rows = rows.map_err(err)?;
+    let columns = rows.columns().to_vec();
+    Ok(into_handle(Cursor {
+        rows: Some(rows),
+        columns,
+    }))
 }
 
 // ============================================================
@@ -258,14 +448,10 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_open(
     _class: JClass,
     dsn: JString,
 ) -> jlong {
-    let dsn: String = match env.get_string(&dsn) {
-        Ok(s) => s.into(),
-        Err(e) => return throw_sql(&mut env, &e.to_string(), 0),
-    };
-    match Database::open(&dsn) {
-        Ok(db) => Box::into_raw(Box::new(db)) as jlong,
-        Err(e) => throw_sql(&mut env, &e.to_string(), 0),
-    }
+    run(&mut env, 0, |env| {
+        let dsn = jstring(env, &dsn)?;
+        Database::open(&dsn).map(into_handle).map_err(err)
+    })
 }
 
 #[no_mangle]
@@ -273,10 +459,9 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_openInMemory(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jlong {
-    match Database::open_in_memory() {
-        Ok(db) => Box::into_raw(Box::new(db)) as jlong,
-        Err(e) => throw_sql(&mut env, &e.to_string(), 0),
-    }
+    run(&mut env, 0, |_| {
+        Database::open_in_memory().map(into_handle).map_err(err)
+    })
 }
 
 #[no_mangle]
@@ -285,21 +470,19 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_closeDb(
     _class: JClass,
     ptr: jlong,
 ) {
-    if ptr != 0 {
-        unsafe {
-            drop(Box::from_raw(ptr as *mut Database));
-        }
-    }
+    unsafe { drop_handle::<Database>(ptr) }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_stoolap_internal_NativeBridge_cloneDb(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    let db = unsafe { as_ref::<Database>(ptr) };
-    Box::into_raw(Box::new(db.clone())) as jlong
+    run(&mut env, 0, |_| {
+        let db = unsafe { handle::<Database>(ptr, "Database")? };
+        Ok(into_handle(db.clone()))
+    })
 }
 
 #[no_mangle]
@@ -307,15 +490,14 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_version<'a>(
     env: JNIEnv<'a>,
     _class: JClass<'a>,
 ) -> JObject<'a> {
-    let v = env!("CARGO_PKG_VERSION");
-    match env.new_string(v) {
+    match env.new_string(env!("CARGO_PKG_VERSION")) {
         Ok(s) => s.into(),
         Err(_) => JObject::null(),
     }
 }
 
 // ============================================================
-// Execute (DDL/DML)
+// Database: execute and query
 // ============================================================
 
 #[no_mangle]
@@ -325,15 +507,11 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_exec(
     ptr: jlong,
     sql: JString,
 ) -> jlong {
-    let db = unsafe { as_ref::<Database>(ptr) };
-    let sql: String = match env.get_string(&sql) {
-        Ok(s) => s.into(),
-        Err(e) => return throw_sql(&mut env, &e.to_string(), -1),
-    };
-    match db.execute(&sql, ()) {
-        Ok(n) => n,
-        Err(e) => throw_sql(&mut env, &e.to_string(), -1),
-    }
+    run(&mut env, -1, |env| {
+        let db = unsafe { handle::<Database>(ptr, "Database")? };
+        let sql = jstring(env, &sql)?;
+        db_exec(db, &sql, Params::none()).map_err(err)
+    })
 }
 
 #[no_mangle]
@@ -342,23 +520,15 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_execParams(
     _class: JClass,
     ptr: jlong,
     sql: JString,
-    params: JByteArray,
+    bin: JByteArray,
 ) -> jlong {
-    let db = unsafe { as_ref::<Database>(ptr) };
-    let sql: String = match env.get_string(&sql) {
-        Ok(s) => s.into(),
-        Err(e) => return throw_sql(&mut env, &e.to_string(), -1),
-    };
-    let values = get_binary_params(&mut env, &params);
-    match db.execute(&sql, values.as_slice()) {
-        Ok(n) => n,
-        Err(e) => throw_sql(&mut env, &e.to_string(), -1),
-    }
+    run(&mut env, -1, |env| {
+        let db = unsafe { handle::<Database>(ptr, "Database")? };
+        let sql = jstring(env, &sql)?;
+        let p = params(env, &bin)?;
+        db_exec(db, &sql, p).map_err(err)
+    })
 }
-
-// ============================================================
-// Query — returns packed binary buffer via byte[]
-// ============================================================
 
 #[no_mangle]
 pub extern "system" fn Java_io_stoolap_internal_NativeBridge_query<'a>(
@@ -367,21 +537,11 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_query<'a>(
     ptr: jlong,
     sql: JString,
 ) -> JByteArray<'a> {
-    let db = unsafe { as_ref::<Database>(ptr) };
-    let sql: String = match env.get_string(&sql) {
-        Ok(s) => s.into(),
-        Err(e) => return throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-    };
-    match db.query(&sql, ()) {
-        Ok(mut rows) => {
-            let buf = encode_rows(&mut rows);
-            match env.byte_array_from_slice(&buf) {
-                Ok(arr) => arr,
-                Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-            }
-        }
-        Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-    }
+    run(&mut env, JByteArray::default(), |env| {
+        let db = unsafe { handle::<Database>(ptr, "Database")? };
+        let sql = jstring(env, &sql)?;
+        pack_all(env, db_query(db, &sql, Params::none()))
+    })
 }
 
 #[no_mangle]
@@ -390,24 +550,30 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_queryParams<'a>(
     _class: JClass,
     ptr: jlong,
     sql: JString,
-    params: JByteArray,
+    bin: JByteArray,
 ) -> JByteArray<'a> {
-    let db = unsafe { as_ref::<Database>(ptr) };
-    let sql: String = match env.get_string(&sql) {
-        Ok(s) => s.into(),
-        Err(e) => return throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-    };
-    let values = get_binary_params(&mut env, &params);
-    match db.query(&sql, values.as_slice()) {
-        Ok(mut rows) => {
-            let buf = encode_rows(&mut rows);
-            match env.byte_array_from_slice(&buf) {
-                Ok(arr) => arr,
-                Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-            }
-        }
-        Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-    }
+    run(&mut env, JByteArray::default(), |env| {
+        let db = unsafe { handle::<Database>(ptr, "Database")? };
+        let sql = jstring(env, &sql)?;
+        let p = params(env, &bin)?;
+        pack_all(env, db_query(db, &sql, p))
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_queryCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    sql: JString,
+    bin: JByteArray,
+) -> jlong {
+    run(&mut env, 0, |env| {
+        let db = unsafe { handle::<Database>(ptr, "Database")? };
+        let sql = jstring(env, &sql)?;
+        let p = params(env, &bin)?;
+        open_cursor(db_query(db, &sql, p))
+    })
 }
 
 // ============================================================
@@ -418,24 +584,18 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_queryParams<'a>(
 pub extern "system" fn Java_io_stoolap_internal_NativeBridge_prepare(
     mut env: JNIEnv,
     _class: JClass,
-    db_ptr: jlong,
+    ptr: jlong,
     sql: JString,
 ) -> jlong {
-    let db = unsafe { as_ref::<Database>(db_ptr) };
-    let sql: String = match env.get_string(&sql) {
-        Ok(s) => s.into(),
-        Err(e) => return throw_sql(&mut env, &e.to_string(), 0),
-    };
-    match db.cached_plan(&sql) {
-        Ok(plan) => {
-            let stmt = PreparedStmt {
-                plan,
-                db: db.clone(),
-            };
-            Box::into_raw(Box::new(stmt)) as jlong
-        }
-        Err(e) => throw_sql(&mut env, &e.to_string(), 0),
-    }
+    run(&mut env, 0, |env| {
+        let db = unsafe { handle::<Database>(ptr, "Database")? };
+        let sql = jstring(env, &sql)?;
+        let stmt = db.prepare(&sql).map_err(err)?;
+        Ok(into_handle(PreparedStmt {
+            stmt,
+            _db: db.clone(),
+        }))
+    })
 }
 
 #[no_mangle]
@@ -444,11 +604,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    if ptr != 0 {
-        unsafe {
-            drop(Box::from_raw(ptr as *mut PreparedStmt));
-        }
-    }
+    unsafe { drop_handle::<PreparedStmt>(ptr) }
 }
 
 #[no_mangle]
@@ -456,14 +612,13 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtExec(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
-    params: JByteArray,
+    bin: JByteArray,
 ) -> jlong {
-    let stmt = unsafe { as_ref::<PreparedStmt>(ptr) };
-    let values = get_binary_params(&mut env, &params);
-    match stmt.db.execute_plan(&stmt.plan, values.as_slice()) {
-        Ok(n) => n,
-        Err(e) => throw_sql(&mut env, &e.to_string(), -1),
-    }
+    run(&mut env, -1, |env| {
+        let s = unsafe { handle::<PreparedStmt>(ptr, "Statement")? };
+        let p = params(env, &bin)?;
+        stmt_exec(&s.stmt, None, p).map_err(err)
+    })
 }
 
 #[no_mangle]
@@ -471,85 +626,67 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtQuery<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass,
     ptr: jlong,
-    params: JByteArray,
+    bin: JByteArray,
 ) -> JByteArray<'a> {
-    let stmt = unsafe { as_ref::<PreparedStmt>(ptr) };
-    let values = get_binary_params(&mut env, &params);
-    match stmt.db.query_plan(&stmt.plan, values.as_slice()) {
-        Ok(mut rows) => {
-            let buf = encode_rows(&mut rows);
-            match env.byte_array_from_slice(&buf) {
-                Ok(arr) => arr,
-                Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-            }
-        }
-        Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-    }
+    run(&mut env, JByteArray::default(), |env| {
+        let s = unsafe { handle::<PreparedStmt>(ptr, "Statement")? };
+        let p = params(env, &bin)?;
+        pack_all(env, stmt_query(&s.stmt, None, p))
+    })
 }
 
-/// Batch execute: takes array of param arrays, runs them all in one JNI call.
+#[no_mangle]
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtQueryCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    bin: JByteArray,
+) -> jlong {
+    run(&mut env, 0, |env| {
+        let s = unsafe { handle::<PreparedStmt>(ptr, "Statement")? };
+        let p = params(env, &bin)?;
+        open_cursor(stmt_query(&s.stmt, None, p))
+    })
+}
+
+/// Runs every row of a batch in one transaction of its own: all rows
+/// commit together, or none do.
 #[no_mangle]
 pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtExecBatch<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass,
     ptr: jlong,
-    batch: JByteArray,
+    bin: JByteArray,
 ) -> JLongArray<'a> {
-    let stmt = unsafe { as_ref::<PreparedStmt>(ptr) };
-    let bytes = match env.convert_byte_array(&batch) {
-        Ok(b) => b,
-        Err(e) => return throw_sql(&mut env, &e.to_string(), JLongArray::default()),
-    };
-    // Auto-wrap in a transaction for atomic batch (same as Python driver).
-    let all_rows = decode_binary_batch(&bytes);
-    let mut tx = match stmt.db.begin() {
-        Ok(tx) => tx,
-        Err(e) => return throw_sql(&mut env, &e.to_string(), JLongArray::default()),
-    };
-    let stmt_ast = stmt.plan.statement.as_ref();
-    let mut results = vec![0i64; all_rows.len()];
-    for (i, values) in all_rows.iter().enumerate() {
-        match tx.execute_prepared(stmt_ast, values.as_slice()) {
-            Ok(n) => results[i] = n,
-            Err(e) => {
-                let _ = tx.rollback();
-                return throw_sql(&mut env, &e.to_string(), JLongArray::default());
-            }
-        }
-    }
-    if let Err(e) = tx.commit() {
-        return throw_sql(&mut env, &e.to_string(), JLongArray::default());
-    }
-    match env.new_long_array(results.len() as i32) {
-        Ok(arr) => {
-            let _ = env.set_long_array_region(&arr, 0, &results);
-            arr
-        }
-        Err(e) => throw_sql(&mut env, &e.to_string(), JLongArray::default()),
-    }
+    run(&mut env, JLongArray::default(), |env| {
+        let s = unsafe { handle::<PreparedStmt>(ptr, "Statement")? };
+        let all = batch(env, &bin)?;
+        let mut tx = s._db.begin().map_err(err)?;
+        let counts = stmt_batch(&s.stmt, &mut tx, all)?; // dropping tx rolls back
+        tx.commit().map_err(err)?;
+        long_array(env, &counts)
+    })
 }
 
 // ============================================================
-// ApiTransactions
+// Transactions
 // ============================================================
 
 #[no_mangle]
 pub extern "system" fn Java_io_stoolap_internal_NativeBridge_begin(
     mut env: JNIEnv,
     _class: JClass,
-    db_ptr: jlong,
+    ptr: jlong,
     isolation: jint,
 ) -> jlong {
-    let db = unsafe { as_ref::<Database>(db_ptr) };
-    let level = if isolation == 1 {
-        IsolationLevel::SnapshotIsolation
-    } else {
-        IsolationLevel::ReadCommitted
-    };
-    match db.begin_with_isolation(level) {
-        Ok(tx) => Box::into_raw(Box::new(tx)) as jlong,
-        Err(e) => throw_sql(&mut env, &e.to_string(), 0),
-    }
+    run(&mut env, 0, |_| {
+        let db = unsafe { handle::<Database>(ptr, "Database")? };
+        let level = match isolation {
+            1 => IsolationLevel::SnapshotIsolation,
+            _ => IsolationLevel::ReadCommitted,
+        };
+        db.begin_with_isolation(level).map(into_handle).map_err(err)
+    })
 }
 
 #[no_mangle]
@@ -558,17 +695,11 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txCommit(
     _class: JClass,
     ptr: jlong,
 ) -> jboolean {
-    if ptr == 0 {
-        return JNI_FALSE;
-    }
-    let tx = unsafe { as_mut::<ApiTransaction>(ptr) };
-    match tx.commit() {
-        Ok(()) => JNI_TRUE,
-        Err(e) => {
-            throw_sql(&mut env, &e.to_string(), ());
-            JNI_FALSE
-        }
-    }
+    run(&mut env, JNI_FALSE, |_| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
+        tx.commit().map_err(err)?;
+        Ok(JNI_TRUE)
+    })
 }
 
 #[no_mangle]
@@ -577,17 +708,11 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txRollback(
     _class: JClass,
     ptr: jlong,
 ) -> jboolean {
-    if ptr == 0 {
-        return JNI_FALSE;
-    }
-    let tx = unsafe { as_mut::<ApiTransaction>(ptr) };
-    match tx.rollback() {
-        Ok(()) => JNI_TRUE,
-        Err(e) => {
-            throw_sql(&mut env, &e.to_string(), ());
-            JNI_FALSE
-        }
-    }
+    run(&mut env, JNI_FALSE, |_| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
+        tx.rollback().map_err(err)?;
+        Ok(JNI_TRUE)
+    })
 }
 
 #[no_mangle]
@@ -596,11 +721,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    if ptr != 0 {
-        unsafe {
-            drop(Box::from_raw(ptr as *mut ApiTransaction));
-        }
-    }
+    unsafe { drop_handle::<ApiTransaction>(ptr) }
 }
 
 #[no_mangle]
@@ -610,15 +731,11 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txExec(
     ptr: jlong,
     sql: JString,
 ) -> jlong {
-    let tx = unsafe { as_mut::<ApiTransaction>(ptr) };
-    let sql: String = match env.get_string(&sql) {
-        Ok(s) => s.into(),
-        Err(e) => return throw_sql(&mut env, &e.to_string(), -1),
-    };
-    match tx.execute(&sql, ()) {
-        Ok(n) => n,
-        Err(e) => throw_sql(&mut env, &e.to_string(), -1),
-    }
+    run(&mut env, -1, |env| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
+        let sql = jstring(env, &sql)?;
+        tx_exec(tx, &sql, Params::none()).map_err(err)
+    })
 }
 
 #[no_mangle]
@@ -627,18 +744,14 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txExecParams(
     _class: JClass,
     ptr: jlong,
     sql: JString,
-    params: JByteArray,
+    bin: JByteArray,
 ) -> jlong {
-    let tx = unsafe { as_mut::<ApiTransaction>(ptr) };
-    let sql: String = match env.get_string(&sql) {
-        Ok(s) => s.into(),
-        Err(e) => return throw_sql(&mut env, &e.to_string(), -1),
-    };
-    let values = get_binary_params(&mut env, &params);
-    match tx.execute(&sql, values.as_slice()) {
-        Ok(n) => n,
-        Err(e) => throw_sql(&mut env, &e.to_string(), -1),
-    }
+    run(&mut env, -1, |env| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
+        let sql = jstring(env, &sql)?;
+        let p = params(env, &bin)?;
+        tx_exec(tx, &sql, p).map_err(err)
+    })
 }
 
 #[no_mangle]
@@ -648,21 +761,11 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txQuery<'a>(
     ptr: jlong,
     sql: JString,
 ) -> JByteArray<'a> {
-    let tx = unsafe { as_mut::<ApiTransaction>(ptr) };
-    let sql: String = match env.get_string(&sql) {
-        Ok(s) => s.into(),
-        Err(e) => return throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-    };
-    match tx.query(&sql, ()) {
-        Ok(mut rows) => {
-            let buf = encode_rows(&mut rows);
-            match env.byte_array_from_slice(&buf) {
-                Ok(arr) => arr,
-                Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-            }
-        }
-        Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-    }
+    run(&mut env, JByteArray::default(), |env| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
+        let sql = jstring(env, &sql)?;
+        pack_all(env, tx_query(tx, &sql, Params::none()))
+    })
 }
 
 #[no_mangle]
@@ -671,24 +774,30 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txQueryParams<'a>(
     _class: JClass,
     ptr: jlong,
     sql: JString,
-    params: JByteArray,
+    bin: JByteArray,
 ) -> JByteArray<'a> {
-    let tx = unsafe { as_mut::<ApiTransaction>(ptr) };
-    let sql: String = match env.get_string(&sql) {
-        Ok(s) => s.into(),
-        Err(e) => return throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-    };
-    let values = get_binary_params(&mut env, &params);
-    match tx.query(&sql, values.as_slice()) {
-        Ok(mut rows) => {
-            let buf = encode_rows(&mut rows);
-            match env.byte_array_from_slice(&buf) {
-                Ok(arr) => arr,
-                Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-            }
-        }
-        Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-    }
+    run(&mut env, JByteArray::default(), |env| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
+        let sql = jstring(env, &sql)?;
+        let p = params(env, &bin)?;
+        pack_all(env, tx_query(tx, &sql, p))
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txQueryCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    sql: JString,
+    bin: JByteArray,
+) -> jlong {
+    run(&mut env, 0, |env| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
+        let sql = jstring(env, &sql)?;
+        let p = params(env, &bin)?;
+        open_cursor(tx_query(tx, &sql, p))
+    })
 }
 
 #[no_mangle]
@@ -697,15 +806,14 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txStmtExec(
     _class: JClass,
     tx_ptr: jlong,
     stmt_ptr: jlong,
-    params: JByteArray,
+    bin: JByteArray,
 ) -> jlong {
-    let tx = unsafe { as_mut::<ApiTransaction>(tx_ptr) };
-    let stmt = unsafe { as_ref::<PreparedStmt>(stmt_ptr) };
-    let values = get_binary_params(&mut env, &params);
-    match tx.execute_prepared(stmt.plan.statement.as_ref(), values.as_slice()) {
-        Ok(n) => n,
-        Err(e) => throw_sql(&mut env, &e.to_string(), -1),
-    }
+    run(&mut env, -1, |env| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(tx_ptr, "Transaction")? };
+        let s = unsafe { handle::<PreparedStmt>(stmt_ptr, "Statement")? };
+        let p = params(env, &bin)?;
+        stmt_exec(&s.stmt, Some(tx), p).map_err(err)
+    })
 }
 
 #[no_mangle]
@@ -714,52 +822,133 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txStmtQuery<'a>(
     _class: JClass,
     tx_ptr: jlong,
     stmt_ptr: jlong,
-    params: JByteArray,
+    bin: JByteArray,
 ) -> JByteArray<'a> {
-    let tx = unsafe { as_mut::<ApiTransaction>(tx_ptr) };
-    let stmt = unsafe { as_ref::<PreparedStmt>(stmt_ptr) };
-    let values = get_binary_params(&mut env, &params);
-    match tx.query_prepared(stmt.plan.statement.as_ref(), values.as_slice()) {
-        Ok(mut rows) => {
-            let buf = encode_rows(&mut rows);
-            match env.byte_array_from_slice(&buf) {
-                Ok(arr) => arr,
-                Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-            }
-        }
-        Err(e) => throw_sql(&mut env, &e.to_string(), JByteArray::default()),
-    }
+    run(&mut env, JByteArray::default(), |env| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(tx_ptr, "Transaction")? };
+        let s = unsafe { handle::<PreparedStmt>(stmt_ptr, "Statement")? };
+        let p = params(env, &bin)?;
+        pack_all(env, stmt_query(&s.stmt, Some(tx), p))
+    })
 }
 
-/// Batch execute prepared statement within a transaction.
+#[no_mangle]
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txStmtQueryCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    tx_ptr: jlong,
+    stmt_ptr: jlong,
+    bin: JByteArray,
+) -> jlong {
+    run(&mut env, 0, |env| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(tx_ptr, "Transaction")? };
+        let s = unsafe { handle::<PreparedStmt>(stmt_ptr, "Statement")? };
+        let p = params(env, &bin)?;
+        open_cursor(stmt_query(&s.stmt, Some(tx), p))
+    })
+}
+
+/// Runs every row of a batch inside the caller's transaction.
 #[no_mangle]
 pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txStmtExecBatch<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass,
     tx_ptr: jlong,
     stmt_ptr: jlong,
-    batch: JByteArray,
+    bin: JByteArray,
 ) -> JLongArray<'a> {
-    let tx = unsafe { as_mut::<ApiTransaction>(tx_ptr) };
-    let stmt = unsafe { as_ref::<PreparedStmt>(stmt_ptr) };
-    let stmt_ast = stmt.plan.statement.as_ref();
-    let bytes = match env.convert_byte_array(&batch) {
-        Ok(b) => b,
-        Err(e) => return throw_sql(&mut env, &e.to_string(), JLongArray::default()),
-    };
-    let all_rows = decode_binary_batch(&bytes);
-    let mut results = vec![0i64; all_rows.len()];
-    for (i, values) in all_rows.iter().enumerate() {
-        match tx.execute_prepared(stmt_ast, values.as_slice()) {
-            Ok(n) => results[i] = n,
-            Err(e) => return throw_sql(&mut env, &e.to_string(), JLongArray::default()),
+    run(&mut env, JLongArray::default(), |env| {
+        let tx = unsafe { handle_mut::<ApiTransaction>(tx_ptr, "Transaction")? };
+        let s = unsafe { handle::<PreparedStmt>(stmt_ptr, "Statement")? };
+        let all = batch(env, &bin)?;
+        let counts = stmt_batch(&s.stmt, tx, all)?;
+        long_array(env, &counts)
+    })
+}
+
+// ============================================================
+// Cursors
+// ============================================================
+
+/// Packs up to `max_rows` more rows of a cursor. A chunk with fewer rows
+/// than asked for is the last; the cursor then returns empty chunks.
+#[no_mangle]
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_cursorFetch<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    ptr: jlong,
+    max_rows: jint,
+) -> JByteArray<'a> {
+    run(&mut env, JByteArray::default(), |env| {
+        let c = unsafe { handle_mut::<Cursor>(ptr, "Cursor")? };
+        if max_rows <= 0 {
+            return Err("max_rows must be positive".into());
         }
+        let max = max_rows as usize;
+        let columns = &c.columns;
+        let rows = &mut c.rows;
+        packed(env, |buf| {
+            let count_at = write_header(columns, buf)?;
+            if let Some(r) = rows {
+                match write_rows(r, max, count_at, buf) {
+                    Ok(n) if n == max => {}
+                    Ok(_) => *rows = None,
+                    Err(e) => {
+                        *rows = None;
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(())
+        })
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_cursorClose(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    unsafe { drop_handle::<Cursor>(ptr) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode(bytes: &[u8]) -> R<Params> {
+        let mut r = Reader::new(bytes);
+        let p = r.params()?;
+        r.finish()?;
+        Ok(p)
     }
-    match env.new_long_array(results.len() as i32) {
-        Ok(arr) => {
-            let _ = env.set_long_array_region(&arr, 0, &results);
-            arr
+
+    #[test]
+    fn refuses_truncated_and_invalid_parameters() {
+        // One INTEGER announced, three of its eight bytes present
+        assert!(decode(&[1, 0, 0, 0, 1, 1, 2, 3]).is_err());
+        // TEXT that is not UTF-8
+        assert!(decode(&[1, 0, 0, 0, 3, 1, 0, 0, 0, 0xff]).is_err());
+        // An unknown tag
+        assert!(decode(&[1, 0, 0, 0, 42]).is_err());
+        // Bytes after the last parameter
+        assert!(decode(&[0, 0, 0, 0, 9]).is_err());
+        // A length that would overflow the buffer position
+        assert!(decode(&[1, 0, 0, 0, 3, 0xff, 0xff, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn decodes_named_parameters_without_their_prefix() {
+        let mut b = vec![];
+        b.extend_from_slice(&(1u32 | NAMED_FLAG).to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(b":id");
+        b.push(1);
+        b.extend_from_slice(&7i64.to_le_bytes());
+        match decode(&b).unwrap() {
+            Params::Named(n) => assert_eq!(n.as_map().get("id"), Some(&Value::Integer(7))),
+            Params::Positional(_) => panic!("expected named parameters"),
         }
-        Err(e) => throw_sql(&mut env, &e.to_string(), JLongArray::default()),
     }
 }

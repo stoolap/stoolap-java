@@ -23,7 +23,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Decodes the packed binary buffer from {@code stoolap_rows_fetch_all()}.
+ * Decodes the packed binary result buffer produced by the native library.
  *
  * <p>Wire format:
  *
@@ -41,9 +41,12 @@ import java.util.List;
  *     BOOLEAN(4):   u8 (0 or 1)
  *     TIMESTAMP(5): i64 LE (8 bytes, nanos since epoch)
  *     JSON(6):      len:u32 LE + bytes
- *     BLOB(7):      len:u32 LE + bytes
+ *     VECTOR(7):    len:u32 LE + packed f32 LE
  * ]
  * </pre>
+ *
+ * <p>Decoded Java types: {@code null}, {@link Long}, {@link Double}, {@link String}, {@link
+ * Boolean}, {@link Instant}, {@link String} (JSON text) and {@code float[]}.
  */
 public final class BulkDecoder {
 
@@ -63,28 +66,19 @@ public final class BulkDecoder {
   /**
    * Decode a packed binary buffer into column names and typed row data.
    *
-   * @param buf Raw bytes from stoolap_rows_fetch_all
+   * @param buf Raw bytes from the native library
    * @return Decoded result with column names and rows
    */
   public static Result decode(byte[] buf) {
     ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
 
-    // Column count
     int colCount = bb.getInt();
-
-    // Column names
     String[] columnNames = new String[colCount];
     for (int i = 0; i < colCount; i++) {
-      int nameLen = Short.toUnsignedInt(bb.getShort());
-      byte[] nameBytes = new byte[nameLen];
-      bb.get(nameBytes);
-      columnNames[i] = new String(nameBytes, StandardCharsets.UTF_8);
+      columnNames[i] = readUtf8(buf, bb, Short.toUnsignedInt(bb.getShort()));
     }
 
-    // Row count
     int rowCount = bb.getInt();
-
-    // Rows
     List<Object[]> rows = new ArrayList<>(rowCount);
     for (int r = 0; r < rowCount; r++) {
       Object[] row = new Object[colCount];
@@ -95,14 +89,14 @@ public final class BulkDecoder {
               case 0 -> null; // NULL
               case 1 -> bb.getLong(); // INTEGER
               case 2 -> bb.getDouble(); // FLOAT
-              case 3 -> readString(bb); // TEXT
+              case 3, 6 -> readUtf8(buf, bb, bb.getInt()); // TEXT, JSON (as String)
               case 4 -> bb.get() != 0; // BOOLEAN
               case 5 -> { // TIMESTAMP
                 long nanos = bb.getLong();
-                yield Instant.ofEpochSecond(nanos / 1_000_000_000L, nanos % 1_000_000_000L);
+                yield Instant.ofEpochSecond(
+                    Math.floorDiv(nanos, 1_000_000_000L), Math.floorMod(nanos, 1_000_000_000L));
               }
-              case 6 -> readString(bb); // JSON (as String)
-              case 7 -> readBytes(bb); // BLOB
+              case 7 -> readVector(bb); // VECTOR
               default -> throw new IllegalArgumentException("Unknown type tag: " + tag);
             };
       }
@@ -112,17 +106,18 @@ public final class BulkDecoder {
     return new Result(columnNames, rows);
   }
 
-  private static String readString(ByteBuffer bb) {
-    int len = bb.getInt();
-    byte[] bytes = new byte[len];
-    bb.get(bytes);
-    return new String(bytes, StandardCharsets.UTF_8);
+  /** Decodes {@code len} UTF-8 bytes in place, without an intermediate copy. */
+  private static String readUtf8(byte[] buf, ByteBuffer bb, int len) {
+    int at = bb.position();
+    bb.position(at + len);
+    return new String(buf, at, len, StandardCharsets.UTF_8);
   }
 
-  private static byte[] readBytes(ByteBuffer bb) {
-    int len = bb.getInt();
-    byte[] bytes = new byte[len];
-    bb.get(bytes);
-    return bytes;
+  private static float[] readVector(ByteBuffer bb) {
+    float[] v = new float[bb.getInt() / 4];
+    for (int i = 0; i < v.length; i++) {
+      v[i] = bb.getFloat();
+    }
+    return v;
   }
 }

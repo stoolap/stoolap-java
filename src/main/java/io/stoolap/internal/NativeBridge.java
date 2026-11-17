@@ -71,6 +71,9 @@ public final class NativeBridge {
   public static native byte[] queryParams(long dbPtr, String sql, byte[] binParams)
       throws SQLException;
 
+  public static native long queryCursor(long dbPtr, String sql, byte[] binParams)
+      throws SQLException;
+
   // ---- Prepared statements ----
 
   public static native long prepare(long dbPtr, String sql) throws SQLException;
@@ -80,6 +83,8 @@ public final class NativeBridge {
   public static native long stmtExec(long stmtPtr, byte[] binParams) throws SQLException;
 
   public static native byte[] stmtQuery(long stmtPtr, byte[] binParams) throws SQLException;
+
+  public static native long stmtQueryCursor(long stmtPtr, byte[] binParams) throws SQLException;
 
   public static native long[] stmtExecBatch(long stmtPtr, byte[] binBatch) throws SQLException;
 
@@ -103,14 +108,27 @@ public final class NativeBridge {
   public static native byte[] txQueryParams(long txPtr, String sql, byte[] binParams)
       throws SQLException;
 
+  public static native long txQueryCursor(long txPtr, String sql, byte[] binParams)
+      throws SQLException;
+
   public static native long txStmtExec(long txPtr, long stmtPtr, byte[] binParams)
       throws SQLException;
 
   public static native byte[] txStmtQuery(long txPtr, long stmtPtr, byte[] binParams)
       throws SQLException;
 
+  public static native long txStmtQueryCursor(long txPtr, long stmtPtr, byte[] binParams)
+      throws SQLException;
+
   public static native long[] txStmtExecBatch(long txPtr, long stmtPtr, byte[] binBatch)
       throws SQLException;
+
+  // ---- Cursors (chunked results) ----
+
+  /** Up to {@code maxRows} more rows; a chunk with fewer rows than asked for is the last. */
+  public static native byte[] cursorFetch(long cursorPtr, int maxRows) throws SQLException;
+
+  public static native void cursorClose(long cursorPtr);
 
   // ---- Library loading ----
 

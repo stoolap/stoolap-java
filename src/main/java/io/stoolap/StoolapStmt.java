@@ -18,6 +18,7 @@ package io.stoolap;
 import io.stoolap.internal.BulkDecoder;
 import io.stoolap.internal.NativeBridge;
 import io.stoolap.internal.ParamEncoder;
+import java.util.Map;
 
 /** A prepared SQL statement backed by a Rust {@code Box<Statement>}. */
 public class StoolapStmt implements AutoCloseable {
@@ -45,6 +46,50 @@ public class StoolapStmt implements AutoCloseable {
     try {
       byte[] buf = NativeBridge.stmtQuery(ptr, ParamEncoder.encode(params));
       return BulkDecoder.decode(buf);
+    } catch (Exception e) {
+      throw new StoolapException(e.getMessage(), e);
+    }
+  }
+
+  /** Executes with named parameters ({@code :name}); returns the rows affected. */
+  public long execute(Map<String, ?> params) throws StoolapException {
+    checkClosed();
+    try {
+      return NativeBridge.stmtExec(ptr, ParamEncoder.encode(params));
+    } catch (Exception e) {
+      throw new StoolapException(e.getMessage(), e);
+    }
+  }
+
+  /** Queries with named parameters ({@code :name}). */
+  public BulkDecoder.Result query(Map<String, ?> params) throws StoolapException {
+    checkClosed();
+    try {
+      return BulkDecoder.decode(NativeBridge.stmtQuery(ptr, ParamEncoder.encode(params)));
+    } catch (Exception e) {
+      throw new StoolapException(e.getMessage(), e);
+    }
+  }
+
+  /** Queries with positional parameters, reading the result in chunks. */
+  public StoolapCursor cursor(Object... params) throws StoolapException {
+    checkClosed();
+    try {
+      return new StoolapCursor(NativeBridge.stmtQueryCursor(ptr, ParamEncoder.encode(params)));
+    } catch (StoolapException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new StoolapException(e.getMessage(), e);
+    }
+  }
+
+  /** Queries with named parameters, reading the result in chunks. */
+  public StoolapCursor cursor(Map<String, ?> params) throws StoolapException {
+    checkClosed();
+    try {
+      return new StoolapCursor(NativeBridge.stmtQueryCursor(ptr, ParamEncoder.encode(params)));
+    } catch (StoolapException e) {
+      throw e;
     } catch (Exception e) {
       throw new StoolapException(e.getMessage(), e);
     }

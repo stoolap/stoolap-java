@@ -229,8 +229,7 @@ public class StoolapPreparedStatement extends StoolapStatement implements Prepar
 
   @Override
   public void setBytes(int i, byte[] x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = x;
+    throw new SQLFeatureNotSupportedException("Stoolap has no BLOB type");
   }
 
   @Override

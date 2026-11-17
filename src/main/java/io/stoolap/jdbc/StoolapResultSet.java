@@ -94,6 +94,7 @@ public class StoolapResultSet implements ResultSet {
     Object val = getColumn(columnIndex);
     if (val == null) return null;
     if (val instanceof String s) return s;
+    if (val instanceof float[] v) return java.util.Arrays.toString(v);
     return val.toString();
   }
 

@@ -78,6 +78,17 @@ public class StoolapConnection implements Connection {
     return new StoolapPreparedStatement(this, sql);
   }
 
+  /** Releases the ended transaction's native handle. */
+  private void endTx() {
+    try {
+      activeTx.close();
+    } catch (StoolapException e) {
+      // close() only rolls back a transaction that has not ended, and this one has
+    } finally {
+      activeTx = null;
+    }
+  }
+
   @Override
   public void setAutoCommit(boolean autoCommit) throws SQLException {
     checkClosed();
@@ -88,9 +99,8 @@ public class StoolapConnection implements Connection {
         activeTx.commit();
       } catch (StoolapException e) {
         throw new SQLException("Failed to commit on autocommit change: " + e.getMessage(), e);
-      } finally {
-        activeTx = null;
       }
+      endTx();
     }
     this.autoCommit = autoCommit;
   }
@@ -111,10 +121,10 @@ public class StoolapConnection implements Connection {
       try {
         activeTx.commit();
       } catch (StoolapException e) {
+        // The transaction stays active, so rollback() can still end it
         throw new SQLException("Commit failed: " + e.getMessage(), e);
-      } finally {
-        activeTx = null;
       }
+      endTx();
     }
   }
 
@@ -130,7 +140,7 @@ public class StoolapConnection implements Connection {
       } catch (StoolapException e) {
         throw new SQLException("Rollback failed: " + e.getMessage(), e);
       } finally {
-        activeTx = null;
+        endTx();
       }
     }
   }
@@ -144,8 +154,9 @@ public class StoolapConnection implements Connection {
           activeTx.rollback();
         } catch (StoolapException e) {
           // Best effort rollback on close
+        } finally {
+          endTx();
         }
-        activeTx = null;
       }
       db.close();
     }
