@@ -60,7 +60,7 @@ jobs:
         working-directory: jni
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.settings.target }}
+        run: cargo build --release --locked --target ${{ matrix.settings.target }}
 
       - name: Strip shared library (macOS)
         if: runner.os == 'macOS'

@@ -12,7 +12,6 @@ release.properties
 
 # Cargo / Rust
 jni/target/
-jni/Cargo.lock
 **/*.rs.bk
 *.pdb
 

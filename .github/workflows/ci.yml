@@ -48,7 +48,7 @@ jobs:
 
       - name: Build stoolap-jni
         working-directory: jni
-        run: cargo build --release --target ${{ matrix.settings.target }}
+        run: cargo build --release --locked --target ${{ matrix.settings.target }}
 
       - name: Strip shared library (macOS)
         if: runner.os == 'macOS'
@@ -122,8 +122,11 @@ jobs:
 
       - name: Run clippy
         working-directory: jni
-        run: cargo clippy --release -- -D warnings
-        continue-on-error: true
+        run: cargo clippy --release --locked --all-targets -- -D warnings
+
+      - name: Run Rust unit tests
+        working-directory: jni
+        run: cargo test --release --locked
 
       - name: Set up JDK
         uses: actions/setup-java@v4

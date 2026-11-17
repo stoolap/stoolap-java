@@ -14,7 +14,7 @@ The driver uses **JNI** to call the Rust API directly (no C FFI layer), with a J
 | **Compiled plans** | `db.prepare(sql)` wraps a `stoolap::api::Statement`; it runs on its compiled plan on the database and inside a transaction alike |
 | **Binary params** | Java encodes parameters to `byte[]` with `ParamEncoder`, Rust decodes with zero JNI reflection (no `is_instance_of` calls) |
 | **Bulk row fetch** | The result is packed in Rust straight into a reused buffer and crosses JNI as one `byte[]`; `BulkDecoder` decodes text in place |
-| **Chunked cursors** | `cursor(...)` reads a large result 1024 rows per JNI call, so it never sits in memory at once |
+| **Chunked cursors** | `cursor(...)` and every JDBC `ResultSet` read a result one chunk per JNI call (1024 rows, or the fetch size), so a large result never sits in memory at once; a small one comes back in the call that runs the query |
 | **Batch in tx** | `executeBatch()` runs every row through the compiled plan in one transaction — no SQL re-parsing per row |
 
 A benchmark suite matching the Python `benchmark.py` is included at
@@ -234,12 +234,13 @@ Supported DSN options (forwarded to the Rust engine):
 
 ### Multi-threaded use
 
-A single `StoolapDB` handle must NOT be used concurrently from multiple threads. Use `cloneHandle()` to create a per-thread handle that shares the underlying engine:
+Every handle is thread-safe. Several threads may run statements on one `StoolapDB` or `StoolapStmt` at once; calls on one `StoolapTx` or `StoolapCursor` run one at a time. `close()` waits for the calls in flight, and a call on a closed handle raises `StoolapException` (SQLState `08003`) instead of touching freed memory. A handle that is never closed is freed once it becomes unreachable, but close handles explicitly: an open database keeps its files locked.
+
+`cloneHandle()` gives another handle on the same engine, closed on its own:
 
 ```java
 StoolapDB main = StoolapDB.openInMemory();
 
-// Per worker thread
 Runnable worker = () -> {
     try (StoolapDB local = main.cloneHandle()) {
         local.query("SELECT ...");
@@ -248,6 +249,8 @@ Runnable worker = () -> {
     }
 };
 ```
+
+Errors carry the SQLState of the engine error: `23505` for a unique or primary key violation, `23502` NOT NULL, `23503` foreign key, `40001` a write conflict worth retrying, `42P01` an unknown table, `42601` a syntax error, and so on.
 
 ---
 
@@ -301,7 +304,9 @@ try (Connection conn = DriverManager.getConnection("jdbc:stoolap:memory://")) {
 }
 ```
 
-In auto-commit mode a batch runs in a transaction of its own: every row commits, or none does. A failing row raises a `BatchUpdateException` that names it (`batch row 2: ...`).
+In auto-commit mode a batch runs in a transaction of its own: every row commits, or none does. A failing row raises a `BatchUpdateException` that names it (`batch row 2: ...`). Parameter values stay set across `addBatch()` and runs until `clearParameters()`, and every parameter up to the highest one set must be set (SQLState `07001` otherwise).
+
+`Statement.execute(sql)` reports a result set exactly when the statement returns columns, so a query with a leading comment, `DESCRIBE` and `INSERT ... RETURNING` all come back as result sets. `Statement.addBatch(String)` runs SQL text in turn.
 
 ### Transaction control
 
@@ -310,7 +315,9 @@ try (Connection conn = DriverManager.getConnection("jdbc:stoolap:memory://")) {
     conn.setAutoCommit(false);
     try (Statement stmt = conn.createStatement()) {
         stmt.executeUpdate("INSERT INTO t VALUES (1, 'a')");
+        Savepoint sp = conn.setSavepoint();
         stmt.executeUpdate("INSERT INTO t VALUES (2, 'b')");
+        conn.rollback(sp);              // keeps row 1
         conn.commit();
     } catch (SQLException e) {
         conn.rollback();
@@ -321,9 +328,39 @@ try (Connection conn = DriverManager.getConnection("jdbc:stoolap:memory://")) {
 }
 ```
 
+With auto-commit off, DML runs in a transaction that begins with the first statement. A Stoolap transaction accepts only DML and savepoints, so **DDL commits the open transaction and runs on its own**, as in MySQL and Oracle (`DatabaseMetaData.dataDefinitionCausesTransactionCommit()` is true). `SHOW`, `DESCRIBE` and `EXPLAIN` run outside the transaction and leave it open, and so does every `DatabaseMetaData` lookup. The SQL statements `BEGIN` and `COMMIT` commit the open transaction and `ROLLBACK` rolls it back. A failed `commit()` leaves the transaction open for `rollback()`.
+
+`setTransactionIsolation` takes `TRANSACTION_READ_COMMITTED` (the default) or `TRANSACTION_REPEATABLE_READ`, which runs each transaction on a snapshot; `READ_UNCOMMITTED` is raised to `READ_COMMITTED` and `SERIALIZABLE` is refused. The level applies from the next transaction.
+
+### Generated keys
+
+`RETURN_GENERATED_KEYS` adds a `RETURNING` clause for the target table's primary key, and the column-name and column-index forms return those columns:
+
+```java
+try (PreparedStatement ps = conn.prepareStatement(
+        "INSERT INTO users (name) VALUES (?)", Statement.RETURN_GENERATED_KEYS)) {
+    ps.setString(1, "Alice");
+    ps.executeUpdate();
+    try (ResultSet keys = ps.getGeneratedKeys()) {
+        keys.next();
+        long id = keys.getLong(1);
+    }
+}
+```
+
+### Result sets, limits and timeouts
+
+`ResultSet` is forward-only and read-only. It streams from the engine one fetch-size chunk at a time (1024 rows by default), and `setMaxRows` stops it early. `ResultSetMetaData` reports each column's type from its first non-null value (`BIGINT`, `DOUBLE`, `VARCHAR`, `BOOLEAN`, `TIMESTAMP`, `OTHER` for JSON and VECTOR, `NULL` when the first chunk holds only NULLs). `getObject(column, type)` converts to the boxed numbers, `BigDecimal`, `BigInteger`, `String`, `Boolean`, `java.sql` date types and `Instant`, `LocalDateTime`, `LocalDate`, `LocalTime`, `OffsetDateTime` and `ZonedDateTime` (at UTC). A value a getter cannot represent raises an `SQLException` (`22018` for text that is not a number, `22003` for a number out of range) instead of returning 0 or null.
+
+`setQueryTimeout` is enforced by the engine for statements that run outside a transaction (auto-commit mode, and DDL); inside a manual-commit transaction it is not enforced. `cancel()` is not supported.
+
+### DatabaseMetaData
+
+`getTables`, `getColumns`, `getPrimaryKeys`, `getIndexInfo`, `getImportedKeys`, `getExportedKeys`, `getCrossReference`, `getTypeInfo` and `getTableTypes` read the catalog through `SHOW TABLES`, `SHOW VIEWS`, `DESCRIBE`, `SHOW INDEXES` and `SHOW CREATE TABLE`, and honour their LIKE patterns. Stoolap has no catalogs or schemas, so `TABLE_CAT` and `TABLE_SCHEM` are null and `getSchemas()` and `getCatalogs()` are empty. A primary key over several columns is reported as a unique index, as the engine stores it. The other lookups return empty results with the JDBC column names.
+
 ### Connection pool integration
 
-`StoolapConnection` maps to a cloned `StoolapDB` handle, making it safe to use with HikariCP, DBCP, or other JDBC pools.
+Each `StoolapConnection` holds its own `StoolapDB` handle, so it pools well with HikariCP, DBCP and other JDBC pools. Statements on one connection run one at a time. Closing a connection closes its statements and result sets and rolls back an open transaction.
 
 ```java
 HikariConfig config = new HikariConfig();
@@ -338,16 +375,16 @@ HikariDataSource ds = new HikariDataSource(config);
 
 | SQL type | Java type (read) | Java type (write) |
 |---|---|---|
-| `INTEGER` | `Long` | `Long`, `Integer`, `Short`, `Byte` |
-| `FLOAT` | `Double` | `Double`, `Float`, `BigDecimal` (JDBC, as double) |
-| `TEXT` | `String` | `String` |
+| `INTEGER` | `Long` | `Long`, `Integer`, `Short`, `Byte`, `BigInteger` (when it fits) |
+| `FLOAT` | `Double` | `Double`, `Float`, `BigDecimal` (as double; Stoolap has no DECIMAL) |
+| `TEXT` | `String` | `String`, `Character`, JDBC `setCharacterStream`/`setClob` |
 | `BOOLEAN` | `Boolean` | `Boolean` |
-| `TIMESTAMP` | `java.time.Instant` (JDBC `getTimestamp`: `java.sql.Timestamp`) | `Instant`, `java.sql.Timestamp`, `OffsetDateTime`, `ZonedDateTime`, `LocalDateTime` (read as UTC) |
+| `TIMESTAMP` | `java.time.Instant` (JDBC `getObject`/`getTimestamp`: `java.sql.Timestamp`) | `Instant`, `java.sql.Timestamp`, `java.util.Date`, `OffsetDateTime`, `ZonedDateTime`, `LocalDateTime` (read as UTC) |
 | `JSON` | `String` | `String` |
 | `VECTOR(n)` | `float[]` (JDBC `getString`: `"[0.1, 0.2]"`) | `float[]` |
 | `NULL` | `null` | `null` |
 
-A TIMESTAMP holds 1677-09-21 to 2262-04-11 UTC; a value outside that range is refused. Stoolap has no BLOB type, so a `byte[]` parameter is refused and JDBC `setBytes` throws `SQLFeatureNotSupportedException`. Any other object binds as its `toString()` text.
+A TIMESTAMP holds 1677-09-21 to 2262-04-11 UTC; a value outside that range is refused. `java.sql.Date` and `LocalDate` bind as `yyyy-MM-dd` text and `java.sql.Time` and `LocalTime` as `HH:mm:ss` text, which a TIMESTAMP column reads as UTC; JDBC `getDate` and `getTime` read a TIMESTAMP's UTC date and time, so they round-trip in any JVM time zone. Stoolap has no BLOB type, so a `byte[]` parameter is refused and JDBC `setBytes` throws `SQLFeatureNotSupportedException`. Any other object binds as its `toString()` text.
 
 Numeric aggregate results (`SUM`, `AVG`, `MIN`, `MAX` over integer columns) may be returned as `Double` depending on the engine's promotion rules. Use `((Number) value).longValue()` / `.doubleValue()` when reading aggregate output.
 
@@ -368,6 +405,8 @@ Numeric aggregate results (`SUM`, `AVG`, `MIN`, `MAX` over integer columns) may 
 +------------------------------------------------------+
 |  io.stoolap.internal                                |
 |  +-- NativeBridge  (static native methods)           |
+|  +-- NativeHandle  (locks + frees one native handle) |
+|  +-- ChunkReader   (cursor chunks for both APIs)     |
 |  +-- ParamEncoder  (Java -> byte[])                  |
 |  +-- BulkDecoder   (byte[] -> Object[])              |
 +------------------------------------------------------+
@@ -409,7 +448,7 @@ type_tag:
 
 A batch is `[row_count:u32]` followed by one parameter set per row. Rust refuses a truncated buffer, invalid UTF-8 and an unknown tag.
 
-**Rows** (Rust -> Java, via `BulkDecoder`): `[column_count:u32][name_len:u16 + name]...[row_count:u32]` followed by one tagged value per cell, with the same tags; a VECTOR is `len:u32` bytes of packed f32.
+**Rows** (Rust -> Java, via `BulkDecoder`): `[column_count:u32][name_len:u16 + name]...[row_count:u32]`, one tagged value per cell with the same tags (a VECTOR is `len:u32` bytes of packed f32), then `[rows_affected:i64]`. A call that opens a cursor returns `[cursor_handle:i64]` before its first chunk; the handle is 0 when that chunk holds the whole result.
 
 ---
 
@@ -430,6 +469,8 @@ stoolap-java/
     |   |-- StoolapException.java
     |   |-- internal/
     |   |   |-- NativeBridge.java    (static native methods + library loader)
+    |   |   |-- NativeHandle.java    (per-handle lock, Cleaner safety net)
+    |   |   |-- ChunkReader.java     (chunked results)
     |   |   |-- ParamEncoder.java    (Java -> byte[])
     |   |   `-- BulkDecoder.java     (byte[] -> Object[])
     |   `-- jdbc/
@@ -447,6 +488,8 @@ stoolap-java/
         |-- JdbcTest.java            (47 tests - JDBC driver)
         |-- PersistenceTest.java     (11 tests - file DB open/reopen)
         |-- DriverFeaturesTest.java  (21 tests - named params, cursors, types, error paths)
+        |-- JdbcConformanceTest.java (21 tests - JDBC behaviour tools rely on)
+        |-- ConcurrencyTest.java     (6 tests - handles shared between threads)
         `-- Benchmark.java           (vs SQLite JDBC)
 ```
 
@@ -459,7 +502,7 @@ export STOOLAP_LIB=jni/target/release/libstoolap_jni.dylib
 mvn test
 ```
 
-136 tests total:
+163 tests total, plus the Rust unit tests (`cd jni && cargo test --release`):
 
 | Test file | Count | Covers |
 |---|---|---|
@@ -467,6 +510,8 @@ mvn test
 | `JdbcTest` | 47 | JDBC driver: Connection, Statement, PreparedStatement, ResultSet, metadata, batches |
 | `PersistenceTest` | 11 | File DB: write → close → reopen → verify (matches Python test_persistence.py) |
 | `DriverFeaturesTest` | 21 | Named parameters, cursors, TIMESTAMP/VECTOR parameters, mid-result errors, closed handles, JDBC batches and transactions |
+| `JdbcConformanceTest` | 21 | DDL with auto-commit off, `execute()` routing (Turkish locale too), batches, parameter checks, dates in a non-UTC zone, `getObject(Class)`, metadata types, streaming, generated keys, isolation, savepoints, SQLState, `DatabaseMetaData` |
+| `ConcurrencyTest` | 6 | Close racing use, shared cursors, transactions and JDBC connections, unclosed handles |
 
 ### Benchmark
 
