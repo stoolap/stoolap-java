@@ -18,23 +18,39 @@ package io.stoolap.jdbc;
 import io.stoolap.StoolapDB;
 import io.stoolap.StoolapException;
 import io.stoolap.StoolapTx;
+import io.stoolap.internal.NativeBridge;
 import java.sql.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.Executor;
 
 /**
- * JDBC Connection wrapping a StoolapDB handle.
+ * JDBC Connection over one {@link StoolapDB} handle.
  *
- * <p>Each Connection holds a cloned StoolapDB handle so connections can be pooled and used from
- * different threads (one thread per connection).
+ * <p>Statements on a connection run one at a time; a connection may be shared between threads but
+ * is meant for one thread at a time, as pools hand it out.
+ *
+ * <p>With auto-commit off, DML runs in a transaction that begins with the first statement. A
+ * Stoolap transaction accepts only DML and savepoints, so DDL commits the open transaction and runs
+ * on its own, as in MySQL and Oracle. SHOW, DESCRIBE and EXPLAIN run outside the transaction and
+ * leave it open. The SQL statements BEGIN and COMMIT commit the open transaction, and ROLLBACK
+ * rolls it back.
  */
 public class StoolapConnection implements Connection {
 
-  private StoolapDB db;
+  private final StoolapDB db;
+  private final Set<StoolapStatement> statements =
+      Collections.newSetFromMap(new IdentityHashMap<>());
   private StoolapTx activeTx;
   private boolean autoCommit = true;
-  private boolean closed;
+  private int isolation = TRANSACTION_READ_COMMITTED;
+  private int savepoints;
+  private volatile boolean closed;
 
   StoolapConnection(StoolapDB db) {
     this.db = db;
@@ -44,24 +60,52 @@ public class StoolapConnection implements Connection {
     return db;
   }
 
-  long getDbPtr() {
-    return db.ptr();
+  synchronized void register(StoolapStatement s) {
+    statements.add(s);
   }
 
-  StoolapTx getActiveTx() {
-    return activeTx;
+  synchronized void unregister(StoolapStatement s) {
+    statements.remove(s);
   }
 
-  long getActiveTxPtr() {
-    return activeTx != null ? activeTx.ptr() : 0;
+  /** The auto-commit mode; the caller holds the connection's lock. */
+  boolean autoCommitNow() {
+    return autoCommit;
   }
 
-  void ensureTx() throws SQLException {
-    if (!autoCommit && activeTx == null) {
+  /**
+   * The transaction a statement placed at {@code placement} runs in, or null to run it on the
+   * database, after committing the open transaction when the placement asks for it. The caller
+   * holds the connection's lock.
+   */
+  StoolapTx txFor(int placement) throws SQLException {
+    checkClosed();
+    if (autoCommit) return null;
+    switch (placement) {
+      case NativeBridge.IN_TX:
+        if (activeTx == null) activeTx = db.begin(isolation == TRANSACTION_REPEATABLE_READ);
+        return activeTx;
+      case NativeBridge.OUTSIDE:
+        return null;
+      default:
+        commitActive();
+        return null;
+    }
+  }
+
+  private void commitActive() throws SQLException {
+    if (activeTx != null) {
+      activeTx.commit(); // a failed commit leaves the transaction for rollback()
+      activeTx = null;
+    }
+  }
+
+  private void rollbackActive() throws SQLException {
+    if (activeTx != null) {
       try {
-        activeTx = db.begin();
-      } catch (StoolapException e) {
-        throw new SQLException("Failed to begin transaction: " + e.getMessage(), e);
+        activeTx.rollback();
+      } finally {
+        activeTx = null;
       }
     }
   }
@@ -75,95 +119,84 @@ public class StoolapConnection implements Connection {
   @Override
   public PreparedStatement prepareStatement(String sql) throws SQLException {
     checkClosed();
-    return new StoolapPreparedStatement(this, sql);
-  }
-
-  /** Releases the ended transaction's native handle. */
-  private void endTx() {
-    try {
-      activeTx.close();
-    } catch (StoolapException e) {
-      // close() only rolls back a transaction that has not ended, and this one has
-    } finally {
-      activeTx = null;
-    }
+    return new StoolapPreparedStatement(this, sql, null);
   }
 
   @Override
-  public void setAutoCommit(boolean autoCommit) throws SQLException {
+  public CallableStatement prepareCall(String sql) throws SQLException {
+    throw new SQLFeatureNotSupportedException("CallableStatement not supported");
+  }
+
+  @Override
+  public String nativeSQL(String sql) throws SQLException {
+    checkClosed();
+    return sql;
+  }
+
+  @Override
+  public synchronized void setAutoCommit(boolean autoCommit) throws SQLException {
     checkClosed();
     if (this.autoCommit == autoCommit) return;
-    if (!this.autoCommit && activeTx != null) {
-      // Switching from manual to auto: commit current tx
+    if (autoCommit) {
       try {
-        activeTx.commit();
+        commitActive();
       } catch (StoolapException e) {
-        throw new SQLException("Failed to commit on autocommit change: " + e.getMessage(), e);
+        throw new SQLException(
+            "Failed to commit on autocommit change: " + e.getMessage(), e.getSQLState(), e);
       }
-      endTx();
     }
     this.autoCommit = autoCommit;
   }
 
   @Override
-  public boolean getAutoCommit() throws SQLException {
+  public synchronized boolean getAutoCommit() throws SQLException {
     checkClosed();
     return autoCommit;
   }
 
   @Override
-  public void commit() throws SQLException {
+  public synchronized void commit() throws SQLException {
     checkClosed();
-    if (autoCommit) {
-      throw new SQLException("Cannot commit in auto-commit mode");
-    }
-    if (activeTx != null) {
-      try {
-        activeTx.commit();
-      } catch (StoolapException e) {
-        // The transaction stays active, so rollback() can still end it
-        throw new SQLException("Commit failed: " + e.getMessage(), e);
-      }
-      endTx();
-    }
+    if (autoCommit) throw new SQLException("Cannot commit in auto-commit mode", "25000");
+    commitActive();
   }
 
   @Override
-  public void rollback() throws SQLException {
+  public synchronized void rollback() throws SQLException {
     checkClosed();
-    if (autoCommit) {
-      throw new SQLException("Cannot rollback in auto-commit mode");
-    }
-    if (activeTx != null) {
-      try {
-        activeTx.rollback();
-      } catch (StoolapException e) {
-        throw new SQLException("Rollback failed: " + e.getMessage(), e);
-      } finally {
-        endTx();
-      }
-    }
+    if (autoCommit) throw new SQLException("Cannot rollback in auto-commit mode", "25000");
+    rollbackActive();
   }
 
+  /** Closes the connection's statements and result sets, rolls back, and closes the handle. */
   @Override
   public void close() throws SQLException {
-    if (!closed) {
+    List<StoolapStatement> open;
+    synchronized (this) {
+      if (closed) return;
       closed = true;
-      if (activeTx != null) {
-        try {
-          activeTx.rollback();
-        } catch (StoolapException e) {
-          // Best effort rollback on close
-        } finally {
-          endTx();
-        }
+      open = new ArrayList<>(statements);
+    }
+    for (StoolapStatement s : open) {
+      try {
+        s.close();
+      } catch (SQLException e) {
+        // best effort; the handle closes below either way
       }
-      db.close();
+    }
+    synchronized (this) {
+      try {
+        rollbackActive();
+      } catch (SQLException e) {
+        // best effort rollback on close
+      } finally {
+        db.close();
+      }
     }
   }
 
   @Override
-  public boolean isClosed() {
+  public boolean isClosed() throws SQLException {
     return closed;
   }
 
@@ -176,7 +209,7 @@ public class StoolapConnection implements Connection {
   @Override
   public void setReadOnly(boolean readOnly) throws SQLException {
     checkClosed();
-    // Stoolap doesn't have a read-only mode, accept silently
+    // Stoolap has no read-only mode; the hint is accepted and ignored, as JDBC allows
   }
 
   @Override
@@ -196,25 +229,40 @@ public class StoolapConnection implements Connection {
     return null;
   }
 
+  /**
+   * READ COMMITTED (the default) or REPEATABLE READ, which runs transactions under snapshot
+   * isolation; READ UNCOMMITTED is raised to READ COMMITTED. SERIALIZABLE is refused. The level
+   * applies from the next transaction.
+   */
   @Override
-  public void setTransactionIsolation(int level) throws SQLException {
+  public synchronized void setTransactionIsolation(int level) throws SQLException {
     checkClosed();
-    // Stoolap supports READ_COMMITTED and SNAPSHOT via begin()
+    switch (level) {
+      case TRANSACTION_READ_UNCOMMITTED, TRANSACTION_READ_COMMITTED ->
+          isolation = TRANSACTION_READ_COMMITTED;
+      case TRANSACTION_REPEATABLE_READ -> isolation = TRANSACTION_REPEATABLE_READ;
+      default ->
+          throw new SQLFeatureNotSupportedException(
+              "Stoolap supports READ COMMITTED and REPEATABLE READ (snapshot) isolation", "0A000");
+    }
   }
 
   @Override
-  public int getTransactionIsolation() throws SQLException {
+  public synchronized int getTransactionIsolation() throws SQLException {
     checkClosed();
-    return Connection.TRANSACTION_READ_COMMITTED;
+    return isolation;
   }
 
   @Override
   public SQLWarning getWarnings() throws SQLException {
+    checkClosed();
     return null;
   }
 
   @Override
-  public void clearWarnings() throws SQLException {}
+  public void clearWarnings() throws SQLException {
+    checkClosed();
+  }
 
   @Override
   public Statement createStatement(int resultSetType, int resultSetConcurrency)
@@ -227,6 +275,99 @@ public class StoolapConnection implements Connection {
       throws SQLException {
     return prepareStatement(sql);
   }
+
+  @Override
+  public CallableStatement prepareCall(String sql, int resultSetType, int resultSetConcurrency)
+      throws SQLException {
+    throw new SQLFeatureNotSupportedException("CallableStatement not supported");
+  }
+
+  @Override
+  public Map<String, Class<?>> getTypeMap() throws SQLException {
+    throw new SQLFeatureNotSupportedException();
+  }
+
+  @Override
+  public void setTypeMap(Map<String, Class<?>> map) throws SQLException {
+    throw new SQLFeatureNotSupportedException();
+  }
+
+  @Override
+  public void setHoldability(int holdability) throws SQLException {
+    checkClosed();
+  }
+
+  @Override
+  public int getHoldability() throws SQLException {
+    return ResultSet.HOLD_CURSORS_OVER_COMMIT;
+  }
+
+  // ---- Savepoints ----
+
+  private record StoolapSavepoint(int id, String name) implements Savepoint {
+    @Override
+    public int getSavepointId() throws SQLException {
+      if (name != null) throw new SQLException("This savepoint is named", "3B000");
+      return id;
+    }
+
+    @Override
+    public String getSavepointName() throws SQLException {
+      if (name == null) throw new SQLException("This savepoint is unnamed", "3B000");
+      return name;
+    }
+
+    String sqlName() {
+      return name != null ? name : "jdbc_savepoint_" + id;
+    }
+  }
+
+  private synchronized void runInTx(String sql) throws SQLException {
+    if (autoCommit) throw new SQLException("Savepoints need auto-commit off", "3B000");
+    txFor(NativeBridge.IN_TX).execute(sql);
+  }
+
+  private static StoolapSavepoint ours(Savepoint s) throws SQLException {
+    if (s instanceof StoolapSavepoint sp) return sp;
+    throw new SQLException("Not a savepoint of this connection", "3B000");
+  }
+
+  @Override
+  public synchronized Savepoint setSavepoint() throws SQLException {
+    checkClosed();
+    StoolapSavepoint sp = new StoolapSavepoint(++savepoints, null);
+    runInTx("SAVEPOINT " + sp.sqlName());
+    return sp;
+  }
+
+  @Override
+  public synchronized Savepoint setSavepoint(String name) throws SQLException {
+    checkClosed();
+    if (name == null || !name.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+      throw new SQLException("A savepoint name must be an identifier: " + name, "3B000");
+    }
+    StoolapSavepoint sp = new StoolapSavepoint(++savepoints, name);
+    runInTx("SAVEPOINT " + sp.sqlName());
+    return sp;
+  }
+
+  @Override
+  public synchronized void rollback(Savepoint savepoint) throws SQLException {
+    checkClosed();
+    String name = ours(savepoint).sqlName();
+    if (activeTx == null) throw new SQLException("No transaction holds " + name, "3B001");
+    runInTx("ROLLBACK TO SAVEPOINT " + name);
+  }
+
+  @Override
+  public synchronized void releaseSavepoint(Savepoint savepoint) throws SQLException {
+    checkClosed();
+    String name = ours(savepoint).sqlName();
+    if (activeTx == null) throw new SQLException("No transaction holds " + name, "3B001");
+    runInTx("RELEASE SAVEPOINT " + name);
+  }
+
+  // ---- Statement variants ----
 
   @Override
   public Statement createStatement(
@@ -242,86 +383,31 @@ public class StoolapConnection implements Connection {
   }
 
   @Override
-  public PreparedStatement prepareStatement(String sql, int autoGeneratedKeys) throws SQLException {
-    return prepareStatement(sql);
-  }
-
-  @Override
-  public PreparedStatement prepareStatement(String sql, int[] columnIndexes) throws SQLException {
-    return prepareStatement(sql);
-  }
-
-  @Override
-  public PreparedStatement prepareStatement(String sql, String[] columnNames) throws SQLException {
-    return prepareStatement(sql);
-  }
-
-  @Override
-  public boolean isValid(int timeout) throws SQLException {
-    return !closed;
-  }
-
-  // --- Unsupported operations ---
-
-  @Override
-  public CallableStatement prepareCall(String sql) throws SQLException {
-    throw new SQLFeatureNotSupportedException("CallableStatement not supported");
-  }
-
-  @Override
-  public String nativeSQL(String sql) throws SQLException {
-    return sql;
-  }
-
-  @Override
-  public Map<String, Class<?>> getTypeMap() throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setTypeMap(Map<String, Class<?>> map) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setHoldability(int holdability) throws SQLException {}
-
-  @Override
-  public int getHoldability() throws SQLException {
-    return ResultSet.HOLD_CURSORS_OVER_COMMIT;
-  }
-
-  @Override
-  public Savepoint setSavepoint() throws SQLException {
-    throw new SQLFeatureNotSupportedException("Savepoints not supported");
-  }
-
-  @Override
-  public Savepoint setSavepoint(String name) throws SQLException {
-    throw new SQLFeatureNotSupportedException("Savepoints not supported");
-  }
-
-  @Override
-  public void rollback(Savepoint savepoint) throws SQLException {
-    throw new SQLFeatureNotSupportedException("Savepoints not supported");
-  }
-
-  @Override
-  public void releaseSavepoint(Savepoint savepoint) throws SQLException {
-    throw new SQLFeatureNotSupportedException("Savepoints not supported");
-  }
-
-  @Override
-  public CallableStatement prepareCall(String sql, int resultSetType, int resultSetConcurrency)
-      throws SQLException {
-    throw new SQLFeatureNotSupportedException("CallableStatement not supported");
-  }
-
-  @Override
   public CallableStatement prepareCall(
       String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability)
       throws SQLException {
     throw new SQLFeatureNotSupportedException("CallableStatement not supported");
+  }
+
+  @Override
+  public PreparedStatement prepareStatement(String sql, int autoGeneratedKeys) throws SQLException {
+    checkClosed();
+    return new StoolapPreparedStatement(
+        this,
+        sql,
+        autoGeneratedKeys == Statement.RETURN_GENERATED_KEYS ? StoolapStatement.PRIMARY_KEY : null);
+  }
+
+  @Override
+  public PreparedStatement prepareStatement(String sql, int[] columnIndexes) throws SQLException {
+    checkClosed();
+    return new StoolapPreparedStatement(this, sql, columnIndexes);
+  }
+
+  @Override
+  public PreparedStatement prepareStatement(String sql, String[] columnNames) throws SQLException {
+    checkClosed();
+    return new StoolapPreparedStatement(this, sql, columnNames);
   }
 
   @Override
@@ -342,6 +428,12 @@ public class StoolapConnection implements Connection {
   @Override
   public SQLXML createSQLXML() throws SQLException {
     throw new SQLFeatureNotSupportedException();
+  }
+
+  @Override
+  public boolean isValid(int timeout) throws SQLException {
+    if (timeout < 0) throw new SQLException("timeout must not be negative", "22023");
+    return !closed && !db.isClosed();
   }
 
   @Override
@@ -371,10 +463,13 @@ public class StoolapConnection implements Connection {
   }
 
   @Override
-  public void setSchema(String schema) throws SQLException {}
+  public void setSchema(String schema) throws SQLException {
+    checkClosed();
+  }
 
   @Override
   public String getSchema() throws SQLException {
+    checkClosed();
     return null;
   }
 
@@ -384,7 +479,9 @@ public class StoolapConnection implements Connection {
   }
 
   @Override
-  public void setNetworkTimeout(Executor executor, int milliseconds) throws SQLException {}
+  public void setNetworkTimeout(Executor executor, int milliseconds) throws SQLException {
+    checkClosed();
+  }
 
   @Override
   public int getNetworkTimeout() throws SQLException {
@@ -393,9 +490,7 @@ public class StoolapConnection implements Connection {
 
   @Override
   public <T> T unwrap(Class<T> iface) throws SQLException {
-    if (iface.isAssignableFrom(getClass())) {
-      return iface.cast(this);
-    }
+    if (iface.isAssignableFrom(getClass())) return iface.cast(this);
     throw new SQLException("Cannot unwrap to " + iface.getName());
   }
 
@@ -404,9 +499,7 @@ public class StoolapConnection implements Connection {
     return iface.isAssignableFrom(getClass());
   }
 
-  private void checkClosed() throws SQLException {
-    if (closed) {
-      throw new SQLException("Connection is closed");
-    }
+  void checkClosed() throws SQLException {
+    if (closed) throw new SQLException("Connection is closed", "08003");
   }
 }

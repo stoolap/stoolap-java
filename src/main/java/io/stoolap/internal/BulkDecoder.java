@@ -43,6 +43,7 @@ import java.util.List;
  *     JSON(6):      len:u32 LE + bytes
  *     VECTOR(7):    len:u32 LE + packed f32 LE
  * ]
+ * [rows_affected: i64 LE]
  * </pre>
  *
  * <p>Decoded Java types: {@code null}, {@link Long}, {@link Double}, {@link String}, {@link
@@ -51,7 +52,16 @@ import java.util.List;
 public final class BulkDecoder {
 
   /** Decoded result from a bulk fetch operation. */
-  public record Result(String[] columnNames, List<Object[]> rows) {
+  /**
+   * A decoded result. {@code columnTags} holds, per column, the type tag of its first non-null
+   * value (0 when every value is null).
+   */
+  public record Result(
+      String[] columnNames, List<Object[]> rows, long rowsAffected, byte[] columnTags) {
+    public Result(String[] columnNames, List<Object[]> rows) {
+      this(columnNames, rows, 0, new byte[columnNames.length]);
+    }
+
     public int getColumnCount() {
       return columnNames.length;
     }
@@ -70,7 +80,13 @@ public final class BulkDecoder {
    * @return Decoded result with column names and rows
    */
   public static Result decode(byte[] buf) {
+    return decode(buf, 0);
+  }
+
+  /** Decodes the packed result that starts at {@code offset} of {@code buf}. */
+  public static Result decode(byte[] buf, int offset) {
     ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+    bb.position(offset);
 
     int colCount = bb.getInt();
     String[] columnNames = new String[colCount];
@@ -79,11 +95,13 @@ public final class BulkDecoder {
     }
 
     int rowCount = bb.getInt();
+    byte[] tags = new byte[colCount];
     List<Object[]> rows = new ArrayList<>(rowCount);
     for (int r = 0; r < rowCount; r++) {
       Object[] row = new Object[colCount];
       for (int c = 0; c < colCount; c++) {
         int tag = Byte.toUnsignedInt(bb.get());
+        if (tags[c] == 0) tags[c] = (byte) tag;
         row[c] =
             switch (tag) {
               case 0 -> null; // NULL
@@ -103,7 +121,7 @@ public final class BulkDecoder {
       rows.add(row);
     }
 
-    return new Result(columnNames, rows);
+    return new Result(columnNames, rows, bb.getLong(), tags);
   }
 
   /** Decodes {@code len} UTF-8 bytes in place, without an intermediate copy. */

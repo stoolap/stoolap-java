@@ -15,12 +15,17 @@
  */
 package io.stoolap.internal;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.Map;
 
@@ -41,10 +46,13 @@ import java.util.Map;
  * (len:u32 + utf8), BOOLEAN=4 (u8), TIMESTAMP=5 (i64 nanos since the epoch), JSON=6 (len:u32 +
  * utf8), VECTOR=7 (count:u32 + f32 LE each).
  *
- * <p>Java types: {@link Long}, {@link Integer}, {@link Short}, {@link Byte} bind as INTEGER;
- * {@link Double}, {@link Float} as FLOAT; {@link String} as TEXT; {@link Boolean} as BOOLEAN;
- * {@link Instant}, {@link java.sql.Timestamp}, {@link OffsetDateTime}, {@link ZonedDateTime} and
- * {@link LocalDateTime} (read as UTC) as TIMESTAMP; {@code float[]} as VECTOR. A {@code byte[]} is
+ * <p>Java types: {@link Long}, {@link Integer}, {@link Short}, {@link Byte} bind as INTEGER; {@link
+ * BigInteger} (when it fits) as INTEGER; {@link Double}, {@link Float}, {@link BigDecimal} as
+ * FLOAT; {@link String}, {@link Character} as TEXT; {@link Boolean} as BOOLEAN; {@link Instant},
+ * {@link java.sql.Timestamp}, {@link java.util.Date}, {@link OffsetDateTime}, {@link ZonedDateTime}
+ * and {@link LocalDateTime} (read as UTC) as TIMESTAMP; {@link java.sql.Date} and {@link LocalDate}
+ * as {@code yyyy-MM-dd} text and {@link java.sql.Time} and {@link LocalTime} as {@code HH:mm:ss}
+ * text, which a TIMESTAMP column reads as UTC; {@code float[]} as VECTOR. A {@code byte[]} is
  * refused, since Stoolap has no BLOB type. Any other object binds as its {@code toString()} text.
  */
 public final class ParamEncoder {
@@ -206,6 +214,30 @@ public final class ParamEncoder {
         writeLong(v.longValue());
       } else if (val instanceof java.sql.Timestamp v) {
         writeTimestamp(v.toInstant());
+      } else if (val instanceof java.sql.Date v) {
+        writeByte((byte) 3);
+        writeUtf8(v.toString());
+      } else if (val instanceof java.sql.Time v) {
+        writeByte((byte) 3);
+        writeUtf8(v.toString());
+      } else if (val instanceof java.util.Date v) {
+        writeTimestamp(v.toInstant());
+      } else if (val instanceof LocalDate v) {
+        writeByte((byte) 3);
+        writeUtf8(v.toString());
+      } else if (val instanceof LocalTime v) {
+        writeByte((byte) 3);
+        writeUtf8(v.format(DateTimeFormatter.ISO_LOCAL_TIME));
+      } else if (val instanceof BigDecimal v) {
+        writeByte((byte) 2);
+        writeDouble(v.doubleValue());
+      } else if (val instanceof BigInteger v) {
+        writeByte((byte) 1);
+        try {
+          writeLong(v.longValueExact());
+        } catch (ArithmeticException e) {
+          throw new IllegalArgumentException(v + " is out of the INTEGER range");
+        }
       } else if (val instanceof Instant v) {
         writeTimestamp(v);
       } else if (val instanceof OffsetDateTime v) {

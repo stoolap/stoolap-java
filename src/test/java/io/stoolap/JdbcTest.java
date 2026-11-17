@@ -893,7 +893,7 @@ class JdbcTest {
       assertTrue(meta.supportsColumnAliasing());
       assertTrue(meta.supportsExpressionsInOrderBy());
       assertFalse(meta.supportsStoredProcedures());
-      assertFalse(meta.supportsSavepoints());
+      assertTrue(meta.supportsSavepoints());
       assertEquals("\"", meta.getIdentifierQuoteString());
     }
   }
@@ -911,7 +911,8 @@ class JdbcTest {
   void testUnsupportedOperations() throws Exception {
     try (Connection conn = DriverManager.getConnection("jdbc:stoolap:memory://")) {
       assertThrows(SQLFeatureNotSupportedException.class, () -> conn.prepareCall("SELECT 1"));
-      assertThrows(SQLFeatureNotSupportedException.class, conn::setSavepoint);
+      // Savepoints need a transaction, so auto-commit mode refuses them
+      assertThrows(SQLException.class, conn::setSavepoint);
     }
   }
 

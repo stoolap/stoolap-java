@@ -15,259 +15,175 @@
  */
 package io.stoolap.jdbc;
 
-import io.stoolap.StoolapException;
 import io.stoolap.StoolapStmt;
-import io.stoolap.internal.BulkDecoder;
+import io.stoolap.internal.ChunkReader;
 import io.stoolap.internal.NativeBridge;
-import io.stoolap.internal.ParamEncoder;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.net.URL;
 import java.sql.*;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Calendar;
 import java.util.List;
 
 /**
- * JDBC PreparedStatement backed by a native Stoolap prepared statement. Parameters use $1, $2, ...
- * syntax mapped from 1-based JDBC indices.
+ * JDBC PreparedStatement on a statement prepared once, which runs on its compiled plan. Every
+ * parameter up to the highest one set must be set before running; values stay set across runs and
+ * {@link #addBatch()} until {@link #clearParameters()}.
  */
 public class StoolapPreparedStatement extends StoolapStatement implements PreparedStatement {
 
   private final StoolapStmt nativeStmt;
-  private final String sql;
-  private Object[] params;
+  private final boolean returnsKeys;
+  private final int placement;
+  private Object[] params = new Object[8];
+  private final BitSet set = new BitSet();
   private int maxParam;
   private final List<Object[]> batch = new ArrayList<>();
 
-  StoolapPreparedStatement(StoolapConnection conn, String sql) throws SQLException {
+  /**
+   * @param keys the generated keys to return: null for none, {@link #PRIMARY_KEY}, column names or
+   *     1-based column indexes
+   */
+  StoolapPreparedStatement(StoolapConnection conn, String sql, Object keys) throws SQLException {
     super(conn);
-    this.sql = sql;
-    this.params = new Object[8];
     try {
-      this.nativeStmt = conn.getDb().prepare(sql);
-    } catch (StoolapException e) {
-      throw new SQLException("Failed to prepare: " + e.getMessage(), e);
+      String keysSql = withReturning(conn, sql, keys);
+      String runSql = keysSql != null ? keysSql : sql;
+      this.returnsKeys = keysSql != null;
+      this.placement = NativeBridge.placement(runSql);
+      this.nativeStmt = conn.getDb().prepare(runSql);
+    } catch (SQLException e) {
+      conn.unregister(this);
+      throw e;
     }
   }
 
-  private Object[] getParamArray() {
-    Object[] result = new Object[maxParam];
-    System.arraycopy(params, 0, result, 0, maxParam);
-    return result;
+  /** The parameter values, refusing a gap below the highest one set. */
+  private Object[] values() throws SQLException {
+    int unset = set.nextClearBit(0);
+    if (unset < maxParam) {
+      throw new SQLException("Parameter " + (unset + 1) + " is not set", "07001");
+    }
+    return Arrays.copyOf(params, maxParam);
   }
 
-  private void ensureCapacity(int index) {
-    if (index > params.length) {
-      Object[] newParams = new Object[Math.max(index, params.length * 2)];
-      System.arraycopy(params, 0, newParams, 0, params.length);
-      params = newParams;
-    }
+  private void put(int index, Object value) throws SQLException {
+    checkClosed();
+    if (index < 1) throw new SQLException("Parameter index out of range: " + index, "07009");
+    if (index > params.length) params = Arrays.copyOf(params, Math.max(index, params.length * 2));
+    params[index - 1] = value;
+    set.set(index - 1);
     if (index > maxParam) maxParam = index;
   }
 
+  private void refuseSqlText() throws SQLException {
+    throw new SQLException(
+        "A PreparedStatement runs its own SQL; use the no-argument form", "HY000");
+  }
+
+  // ---- Running ----
+
   @Override
   public ResultSet executeQuery() throws SQLException {
-    checkClosed();
-    closeCurrentResultSet();
-    try {
-      conn.ensureTx();
-      long txPtr = conn.getActiveTxPtr();
-      byte[] buf;
-      byte[] binParams = ParamEncoder.encode(getParamArray());
-      if (txPtr != 0) {
-        buf = NativeBridge.txStmtQuery(txPtr, nativeStmt.ptr(), binParams);
-      } else {
-        buf = NativeBridge.stmtQuery(nativeStmt.ptr(), binParams);
-      }
-      currentResultSet = new StoolapResultSet(this, BulkDecoder.decode(buf));
-      return currentResultSet;
-    } catch (Exception e) {
-      throw new SQLException(e.getMessage(), e);
-    }
+    beginRun();
+    return queryResult(open(null, nativeStmt, values(), placement));
   }
 
   @Override
   public int executeUpdate() throws SQLException {
-    checkClosed();
-    closeCurrentResultSet();
-    try {
-      conn.ensureTx();
-      long txPtr = conn.getActiveTxPtr();
-      long affected;
-      byte[] binParams = ParamEncoder.encode(getParamArray());
-      if (txPtr != 0) {
-        affected = NativeBridge.txStmtExec(txPtr, nativeStmt.ptr(), binParams);
-      } else {
-        affected = NativeBridge.stmtExec(nativeStmt.ptr(), binParams);
-      }
-      updateCount = affected;
-      return (int) affected;
-    } catch (Exception e) {
-      throw new SQLException(e.getMessage(), e);
-    }
+    return (int) Math.min(executeLargeUpdate(), Integer.MAX_VALUE);
+  }
+
+  @Override
+  public long executeLargeUpdate() throws SQLException {
+    beginRun();
+    if (returnsKeys) return keepKeys(open(null, nativeStmt, values(), placement));
+    updateCount = update(null, nativeStmt, values(), placement);
+    return updateCount;
   }
 
   @Override
   public boolean execute() throws SQLException {
-    String trimmed = sql.trim().toUpperCase();
-    if (trimmed.startsWith("SELECT")
-        || trimmed.startsWith("WITH")
-        || trimmed.startsWith("EXPLAIN")
-        || trimmed.startsWith("SHOW")
-        || trimmed.startsWith("VALUES")) {
-      executeQuery();
-      return true;
-    } else {
-      executeUpdate();
+    beginRun();
+    ChunkReader reader = open(null, nativeStmt, values(), placement);
+    if (returnsKeys) {
+      keepKeys(reader);
       return false;
     }
+    return present(reader);
   }
 
   @Override
   public void addBatch() throws SQLException {
-    batch.add(getParamArray());
-    clearParameters();
-  }
-
-  @Override
-  public int[] executeBatch() throws SQLException {
     checkClosed();
-    try {
-      conn.ensureTx();
-      long txPtr = conn.getActiveTxPtr();
-      byte[] binBatch = ParamEncoder.encodeBatch(batch.toArray(new Object[0][]));
-      long[] results;
-      if (txPtr != 0) {
-        results = NativeBridge.txStmtExecBatch(txPtr, nativeStmt.ptr(), binBatch);
-      } else {
-        results = NativeBridge.stmtExecBatch(nativeStmt.ptr(), binBatch);
-      }
-      int[] intResults = new int[results.length];
-      for (int i = 0; i < results.length; i++) intResults[i] = (int) results[i];
-      return intResults;
-    } catch (Exception e) {
-      throw new BatchUpdateException(e.getMessage(), new int[0], e);
-    } finally {
-      batch.clear();
-    }
+    batch.add(values());
   }
 
   @Override
   public void clearBatch() throws SQLException {
+    checkClosed();
     batch.clear();
   }
 
   @Override
+  public int[] executeBatch() throws SQLException {
+    long[] counts = executeLargeBatch();
+    int[] out = new int[counts.length];
+    for (int i = 0; i < counts.length; i++) out[i] = (int) Math.min(counts[i], Integer.MAX_VALUE);
+    return out;
+  }
+
+  /**
+   * Runs every parameter set added with {@link #addBatch()}. In auto-commit mode the batch runs in
+   * a transaction of its own: every row commits, or none does.
+   */
+  @Override
+  public long[] executeLargeBatch() throws SQLException {
+    beginRun();
+    Object[][] rows = batch.toArray(new Object[0][]);
+    batch.clear();
+    try {
+      if (!returnsKeys) return batch(nativeStmt, rows, placement);
+      long[] counts = new long[rows.length];
+      List<Object[]> keys = new ArrayList<>();
+      String[] keyColumns = new String[0];
+      for (int i = 0; i < rows.length; i++) {
+        ChunkReader reader = open(null, nativeStmt, rows[i], placement);
+        keyColumns = reader.columnNames();
+        try {
+          for (Object[] row; (row = reader.next()) != null; ) {
+            keys.add(row);
+            counts[i]++;
+          }
+        } finally {
+          reader.close();
+        }
+      }
+      generatedKeys = new StoolapResultSet(this, keyColumns, keys);
+      return counts;
+    } catch (BatchUpdateException e) {
+      throw e;
+    } catch (SQLException e) {
+      throw new BatchUpdateException(e.getMessage(), e.getSQLState(), 0, new long[0], e);
+    }
+  }
+
+  @Override
   public void clearParameters() throws SQLException {
-    java.util.Arrays.fill(params, 0, maxParam, null);
+    checkClosed();
+    Arrays.fill(params, 0, maxParam, null);
+    set.clear();
     maxParam = 0;
-  }
-
-  // --- Parameter setters (zero-allocation path for primitives via boxing) ---
-
-  @Override
-  public void setNull(int i, int t) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = null;
-  }
-
-  @Override
-  public void setBoolean(int i, boolean x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = x;
-  }
-
-  @Override
-  public void setByte(int i, byte x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = (long) x;
-  }
-
-  @Override
-  public void setShort(int i, short x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = (long) x;
-  }
-
-  @Override
-  public void setInt(int i, int x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = (long) x;
-  }
-
-  @Override
-  public void setLong(int i, long x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = x;
-  }
-
-  @Override
-  public void setFloat(int i, float x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = (double) x;
-  }
-
-  @Override
-  public void setDouble(int i, double x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = x;
-  }
-
-  @Override
-  public void setBigDecimal(int i, BigDecimal x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = x != null ? x.doubleValue() : null;
-  }
-
-  @Override
-  public void setString(int i, String x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = x;
-  }
-
-  @Override
-  public void setBytes(int i, byte[] x) throws SQLException {
-    throw new SQLFeatureNotSupportedException("Stoolap has no BLOB type");
-  }
-
-  @Override
-  public void setDate(int i, Date x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = x != null ? x.toString() : null;
-  }
-
-  @Override
-  public void setTime(int i, Time x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = x != null ? x.toString() : null;
-  }
-
-  @Override
-  public void setTimestamp(int i, Timestamp x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = x;
-  }
-
-  @Override
-  public void setObject(int i, Object x) throws SQLException {
-    ensureCapacity(i);
-    params[i - 1] = x;
-  }
-
-  @Override
-  public void setObject(int i, Object x, int t) throws SQLException {
-    setObject(i, x);
-  }
-
-  @Override
-  public void setObject(int i, Object x, int t, int s) throws SQLException {
-    setObject(i, x);
   }
 
   @Override
   public ResultSetMetaData getMetaData() throws SQLException {
+    checkClosed();
     return currentResultSet != null ? currentResultSet.getMetaData() : null;
   }
 
@@ -278,127 +194,237 @@ public class StoolapPreparedStatement extends StoolapStatement implements Prepar
 
   @Override
   public void close() throws SQLException {
-    if (!closed) {
-      closed = true;
-      closeCurrentResultSet();
+    if (closed) return;
+    try {
+      super.close();
+    } finally {
       nativeStmt.close();
     }
   }
 
-  // --- Unsupported setters ---
+  // ---- SQL text forms are refused on a PreparedStatement ----
+
   @Override
-  public void setAsciiStream(int i, InputStream x, int l) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
+  public ResultSet executeQuery(String sql) throws SQLException {
+    refuseSqlText();
+    return null;
   }
 
   @Override
-  @SuppressWarnings("deprecation")
-  public void setUnicodeStream(int i, InputStream x, int l) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
+  public int executeUpdate(String sql) throws SQLException {
+    refuseSqlText();
+    return 0;
   }
 
   @Override
-  public void setBinaryStream(int i, InputStream x, int l) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
+  public long executeLargeUpdate(String sql) throws SQLException {
+    refuseSqlText();
+    return 0;
   }
 
   @Override
-  public void setRef(int i, Ref x) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
+  public boolean execute(String sql) throws SQLException {
+    refuseSqlText();
+    return false;
   }
 
   @Override
-  public void setBlob(int i, Blob x) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
+  public void addBatch(String sql) throws SQLException {
+    refuseSqlText();
+  }
+
+  // ---- Parameter setters ----
+
+  @Override
+  public void setNull(int i, int sqlType) throws SQLException {
+    put(i, null);
   }
 
   @Override
-  public void setClob(int i, Clob x) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
+  public void setNull(int i, int sqlType, String typeName) throws SQLException {
+    put(i, null);
   }
 
   @Override
-  public void setArray(int i, Array x) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
+  public void setBoolean(int i, boolean x) throws SQLException {
+    put(i, x);
   }
 
   @Override
-  public void setDate(int i, Date x, Calendar c) throws SQLException {
+  public void setByte(int i, byte x) throws SQLException {
+    put(i, (long) x);
+  }
+
+  @Override
+  public void setShort(int i, short x) throws SQLException {
+    put(i, (long) x);
+  }
+
+  @Override
+  public void setInt(int i, int x) throws SQLException {
+    put(i, (long) x);
+  }
+
+  @Override
+  public void setLong(int i, long x) throws SQLException {
+    put(i, x);
+  }
+
+  @Override
+  public void setFloat(int i, float x) throws SQLException {
+    put(i, (double) x);
+  }
+
+  @Override
+  public void setDouble(int i, double x) throws SQLException {
+    put(i, x);
+  }
+
+  /** Binds as FLOAT: Stoolap has no DECIMAL type. */
+  @Override
+  public void setBigDecimal(int i, BigDecimal x) throws SQLException {
+    put(i, x != null ? x.doubleValue() : null);
+  }
+
+  @Override
+  public void setString(int i, String x) throws SQLException {
+    put(i, x);
+  }
+
+  @Override
+  public void setNString(int i, String x) throws SQLException {
+    put(i, x);
+  }
+
+  @Override
+  public void setBytes(int i, byte[] x) throws SQLException {
+    throw new SQLFeatureNotSupportedException("Stoolap has no BLOB type");
+  }
+
+  /** Binds {@code yyyy-MM-dd} text, which a TIMESTAMP column reads as midnight UTC. */
+  @Override
+  public void setDate(int i, Date x) throws SQLException {
+    put(i, x != null ? x.toString() : null);
+  }
+
+  @Override
+  public void setDate(int i, Date x, Calendar cal) throws SQLException {
     setDate(i, x);
   }
 
+  /** Binds {@code HH:mm:ss} text, which a TIMESTAMP column reads as that time UTC. */
   @Override
-  public void setTime(int i, Time x, Calendar c) throws SQLException {
+  public void setTime(int i, Time x) throws SQLException {
+    put(i, x != null ? x.toString() : null);
+  }
+
+  @Override
+  public void setTime(int i, Time x, Calendar cal) throws SQLException {
     setTime(i, x);
   }
 
+  /** Binds the timestamp's instant. */
   @Override
-  public void setTimestamp(int i, Timestamp x, Calendar c) throws SQLException {
-    setTimestamp(i, x);
+  public void setTimestamp(int i, Timestamp x) throws SQLException {
+    put(i, x);
   }
 
   @Override
-  public void setNull(int i, int t, String n) throws SQLException {
-    setNull(i, t);
+  public void setTimestamp(int i, Timestamp x, Calendar cal) throws SQLException {
+    put(i, x);
+  }
+
+  @Override
+  public void setObject(int i, Object x) throws SQLException {
+    if (x instanceof byte[]) setBytes(i, (byte[]) x);
+    put(i, x);
+  }
+
+  @Override
+  public void setObject(int i, Object x, int targetSqlType) throws SQLException {
+    setObject(i, x);
+  }
+
+  @Override
+  public void setObject(int i, Object x, int targetSqlType, int scaleOrLength) throws SQLException {
+    setObject(i, x);
   }
 
   @Override
   public void setURL(int i, URL x) throws SQLException {
-    setString(i, x != null ? x.toString() : null);
+    put(i, x != null ? x.toString() : null);
+  }
+
+  private static String read(Reader r, long length) throws SQLException {
+    if (r == null) return null;
+    StringBuilder sb = new StringBuilder();
+    char[] buf = new char[8192];
+    try {
+      long left = length < 0 ? Long.MAX_VALUE : length;
+      for (int n; left > 0 && (n = r.read(buf, 0, (int) Math.min(buf.length, left))) > 0; ) {
+        sb.append(buf, 0, n);
+        left -= n;
+      }
+    } catch (IOException e) {
+      throw new SQLException("Failed to read the parameter: " + e.getMessage(), "HY000", e);
+    }
+    return sb.toString();
   }
 
   @Override
-  public void setRowId(int i, RowId x) throws SQLException {
+  public void setCharacterStream(int i, Reader r) throws SQLException {
+    put(i, read(r, -1));
+  }
+
+  @Override
+  public void setCharacterStream(int i, Reader r, int length) throws SQLException {
+    put(i, read(r, length));
+  }
+
+  @Override
+  public void setCharacterStream(int i, Reader r, long length) throws SQLException {
+    put(i, read(r, length));
+  }
+
+  @Override
+  public void setNCharacterStream(int i, Reader r) throws SQLException {
+    put(i, read(r, -1));
+  }
+
+  @Override
+  public void setNCharacterStream(int i, Reader r, long length) throws SQLException {
+    put(i, read(r, length));
+  }
+
+  @Override
+  public void setClob(int i, Reader r) throws SQLException {
+    put(i, read(r, -1));
+  }
+
+  @Override
+  public void setClob(int i, Reader r, long length) throws SQLException {
+    put(i, read(r, length));
+  }
+
+  @Override
+  public void setNClob(int i, Reader r) throws SQLException {
+    put(i, read(r, -1));
+  }
+
+  @Override
+  public void setNClob(int i, Reader r, long length) throws SQLException {
+    put(i, read(r, length));
+  }
+
+  // ---- Unsupported: binary streams, LOB objects, arrays, refs ----
+
+  @Override
+  public void setAsciiStream(int i, InputStream x, int length) throws SQLException {
     throw new SQLFeatureNotSupportedException();
   }
 
   @Override
-  public void setNString(int i, String v) throws SQLException {
-    setString(i, v);
-  }
-
-  @Override
-  public void setNCharacterStream(int i, Reader v, long l) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setNClob(int i, NClob v) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setClob(int i, Reader r, long l) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setBlob(int i, InputStream s, long l) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setNClob(int i, Reader r, long l) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setSQLXML(int i, SQLXML x) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setAsciiStream(int i, InputStream x, long l) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setBinaryStream(int i, InputStream x, long l) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setCharacterStream(int i, Reader r, long l) throws SQLException {
+  public void setAsciiStream(int i, InputStream x, long length) throws SQLException {
     throw new SQLFeatureNotSupportedException();
   }
 
@@ -408,37 +434,68 @@ public class StoolapPreparedStatement extends StoolapStatement implements Prepar
   }
 
   @Override
+  @SuppressWarnings("deprecation")
+  public void setUnicodeStream(int i, InputStream x, int length) throws SQLException {
+    throw new SQLFeatureNotSupportedException();
+  }
+
+  @Override
+  public void setBinaryStream(int i, InputStream x, int length) throws SQLException {
+    throw new SQLFeatureNotSupportedException("Stoolap has no BLOB type");
+  }
+
+  @Override
+  public void setBinaryStream(int i, InputStream x, long length) throws SQLException {
+    throw new SQLFeatureNotSupportedException("Stoolap has no BLOB type");
+  }
+
+  @Override
   public void setBinaryStream(int i, InputStream x) throws SQLException {
+    throw new SQLFeatureNotSupportedException("Stoolap has no BLOB type");
+  }
+
+  @Override
+  public void setBlob(int i, Blob x) throws SQLException {
+    throw new SQLFeatureNotSupportedException("Stoolap has no BLOB type");
+  }
+
+  @Override
+  public void setBlob(int i, InputStream x, long length) throws SQLException {
+    throw new SQLFeatureNotSupportedException("Stoolap has no BLOB type");
+  }
+
+  @Override
+  public void setBlob(int i, InputStream x) throws SQLException {
+    throw new SQLFeatureNotSupportedException("Stoolap has no BLOB type");
+  }
+
+  @Override
+  public void setClob(int i, Clob x) throws SQLException {
+    put(i, x != null ? x.getSubString(1, (int) x.length()) : null);
+  }
+
+  @Override
+  public void setNClob(int i, NClob x) throws SQLException {
+    put(i, x != null ? x.getSubString(1, (int) x.length()) : null);
+  }
+
+  @Override
+  public void setRef(int i, Ref x) throws SQLException {
     throw new SQLFeatureNotSupportedException();
   }
 
   @Override
-  public void setCharacterStream(int i, Reader r) throws SQLException {
+  public void setArray(int i, Array x) throws SQLException {
     throw new SQLFeatureNotSupportedException();
   }
 
   @Override
-  public void setNCharacterStream(int i, Reader v) throws SQLException {
+  public void setRowId(int i, RowId x) throws SQLException {
     throw new SQLFeatureNotSupportedException();
   }
 
   @Override
-  public void setClob(int i, Reader r) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setBlob(int i, InputStream s) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setNClob(int i, Reader r) throws SQLException {
-    throw new SQLFeatureNotSupportedException();
-  }
-
-  @Override
-  public void setCharacterStream(int i, Reader r, int l) throws SQLException {
+  public void setSQLXML(int i, SQLXML x) throws SQLException {
     throw new SQLFeatureNotSupportedException();
   }
 }

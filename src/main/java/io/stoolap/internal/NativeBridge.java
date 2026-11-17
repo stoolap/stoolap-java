@@ -45,6 +45,10 @@ public final class NativeBridge {
 
   private NativeBridge() {}
 
+  // Every handle argument must be live for the whole call; NativeHandle guarantees that.
+  // A params argument may be null for no parameters. A *QueryCursor call returns
+  // [cursor_handle:i64][first chunk]; see ChunkReader.
+
   // ---- Database lifecycle ----
 
   public static native long open(String dsn) throws SQLException;
@@ -53,26 +57,39 @@ public final class NativeBridge {
 
   public static native void closeDb(long ptr);
 
-  public static native long cloneDb(long ptr);
+  public static native long cloneDb(long ptr) throws SQLException;
 
   public static native String version();
 
-  // ---- Execute (DDL/DML) ----
+  /** {@link #placement}: run inside the open transaction (DML, savepoints). */
+  public static final int IN_TX = 0;
 
-  public static native long exec(long dbPtr, String sql) throws SQLException;
+  /** {@link #placement}: commit the open transaction, then run outside it (DDL). */
+  public static final int COMMIT_FIRST = 1;
 
-  public static native long execParams(long dbPtr, String sql, byte[] binParams)
+  /** {@link #placement}: run outside, leaving the transaction open (SHOW, DESCRIBE, EXPLAIN). */
+  public static final int OUTSIDE = 2;
+
+  /** {@link #placement}: BEGIN or COMMIT, which commit the open transaction. */
+  public static final int COMMIT = 3;
+
+  /** {@link #placement}: ROLLBACK, which rolls the open transaction back. */
+  public static final int ROLLBACK = 4;
+
+  /** Where a manual-commit connection runs {@code sql}: one of the constants above. */
+  public static native int placement(String sql) throws SQLException;
+
+  // ---- Database: execute and query ----
+
+  /** A {@code timeoutMs} above zero bounds the statement's run time (positional params only). */
+  public static native long execParams(long dbPtr, String sql, byte[] params, int timeoutMs)
       throws SQLException;
 
-  // ---- Query (returns packed byte[] via BulkDecoder format) ----
-
-  public static native byte[] query(long dbPtr, String sql) throws SQLException;
-
-  public static native byte[] queryParams(long dbPtr, String sql, byte[] binParams)
+  public static native byte[] queryParams(long dbPtr, String sql, byte[] params)
       throws SQLException;
 
-  public static native long queryCursor(long dbPtr, String sql, byte[] binParams)
-      throws SQLException;
+  public static native byte[] queryCursor(
+      long dbPtr, String sql, byte[] params, int maxRows, int timeoutMs) throws SQLException;
 
   // ---- Prepared statements ----
 
@@ -80,13 +97,16 @@ public final class NativeBridge {
 
   public static native void stmtClose(long stmtPtr);
 
-  public static native long stmtExec(long stmtPtr, byte[] binParams) throws SQLException;
+  public static native long stmtExec(long stmtPtr, byte[] params) throws SQLException;
 
-  public static native byte[] stmtQuery(long stmtPtr, byte[] binParams) throws SQLException;
+  public static native byte[] stmtQuery(long stmtPtr, byte[] params) throws SQLException;
 
-  public static native long stmtQueryCursor(long stmtPtr, byte[] binParams) throws SQLException;
+  public static native byte[] stmtQueryCursor(long stmtPtr, byte[] params, int maxRows)
+      throws SQLException;
 
-  public static native long[] stmtExecBatch(long stmtPtr, byte[] binBatch) throws SQLException;
+  /** Runs the batch in a transaction of its own on the database: all rows commit, or none. */
+  public static native long[] stmtExecBatch(long dbPtr, long stmtPtr, byte[] batch)
+      throws SQLException;
 
   // ---- Transactions ----
 
@@ -98,29 +118,23 @@ public final class NativeBridge {
 
   public static native void txClose(long txPtr);
 
-  public static native long txExec(long txPtr, String sql) throws SQLException;
+  public static native long txExecParams(long txPtr, String sql, byte[] params) throws SQLException;
 
-  public static native long txExecParams(long txPtr, String sql, byte[] binParams)
+  public static native byte[] txQueryParams(long txPtr, String sql, byte[] params)
       throws SQLException;
 
-  public static native byte[] txQuery(long txPtr, String sql) throws SQLException;
-
-  public static native byte[] txQueryParams(long txPtr, String sql, byte[] binParams)
+  public static native byte[] txQueryCursor(long txPtr, String sql, byte[] params, int maxRows)
       throws SQLException;
 
-  public static native long txQueryCursor(long txPtr, String sql, byte[] binParams)
+  public static native long txStmtExec(long txPtr, long stmtPtr, byte[] params) throws SQLException;
+
+  public static native byte[] txStmtQuery(long txPtr, long stmtPtr, byte[] params)
       throws SQLException;
 
-  public static native long txStmtExec(long txPtr, long stmtPtr, byte[] binParams)
-      throws SQLException;
+  public static native byte[] txStmtQueryCursor(
+      long txPtr, long stmtPtr, byte[] params, int maxRows) throws SQLException;
 
-  public static native byte[] txStmtQuery(long txPtr, long stmtPtr, byte[] binParams)
-      throws SQLException;
-
-  public static native long txStmtQueryCursor(long txPtr, long stmtPtr, byte[] binParams)
-      throws SQLException;
-
-  public static native long[] txStmtExecBatch(long txPtr, long stmtPtr, byte[] binBatch)
+  public static native long[] txStmtExecBatch(long txPtr, long stmtPtr, byte[] batch)
       throws SQLException;
 
   // ---- Cursors (chunked results) ----

@@ -15,9 +15,7 @@
  */
 package io.stoolap;
 
-import io.stoolap.internal.BulkDecoder;
-import io.stoolap.internal.NativeBridge;
-import java.util.List;
+import io.stoolap.internal.ChunkReader;
 
 /**
  * Reads a query result in chunks, so a large result never sits in memory at once.
@@ -30,66 +28,32 @@ import java.util.List;
  * }
  * }</pre>
  *
- * <p>Each chunk crosses JNI in one call. The cursor releases its native result once the last row
- * is read, or on {@link #close()}. A cursor opened in a transaction should be read before the
- * transaction ends. A cursor is not thread-safe.
+ * <p>Each chunk of 1024 rows crosses JNI in one call. The cursor releases its native result once
+ * the last row is read, or on {@link #close()}. A runtime error part way through the result is
+ * raised from {@link #next()}. A cursor opened in a transaction should be read before the
+ * transaction ends.
  */
 public final class StoolapCursor implements AutoCloseable {
 
-  /** Rows fetched per JNI call. */
-  private static final int CHUNK_SIZE = 1024;
+  private final ChunkReader reader;
 
-  private long ptr;
-  private String[] columnNames;
-  private List<Object[]> chunk = List.of();
-  private int index;
-
-  StoolapCursor(long ptr) throws StoolapException {
-    this.ptr = ptr;
-    fetch();
+  StoolapCursor(ChunkReader reader) {
+    this.reader = reader;
   }
 
   /** The result's column names. */
   public String[] columnNames() {
-    return columnNames;
+    return reader.columnNames();
   }
 
-  /** The next row, or {@code null} when the result is exhausted. */
+  /** The next row, or {@code null} when the result is exhausted or the cursor is closed. */
   public Object[] next() throws StoolapException {
-    if (index == chunk.size()) {
-      if (ptr == 0) return null;
-      fetch();
-      if (chunk.isEmpty()) return null;
-    }
-    return chunk.get(index++);
+    return reader.next();
   }
 
-  private void fetch() throws StoolapException {
-    try {
-      BulkDecoder.Result r = BulkDecoder.decode(NativeBridge.cursorFetch(ptr, CHUNK_SIZE));
-      columnNames = r.columnNames();
-      chunk = r.rows();
-      index = 0;
-      if (chunk.size() < CHUNK_SIZE) release();
-    } catch (Exception e) {
-      close();
-      throw new StoolapException(e.getMessage(), e);
-    }
-  }
-
-  /** Closes the cursor; {@link #next()} returns {@code null} from then on. */
+  /** Closes the cursor; {@link #next()} returns {@code null} from then on. Idempotent. */
   @Override
   public void close() {
-    release();
-    chunk = List.of();
-    index = 0;
-  }
-
-  /** Frees the native result, keeping the rows already fetched. */
-  private void release() {
-    if (ptr != 0) {
-      NativeBridge.cursorClose(ptr);
-      ptr = 0;
-    }
+    reader.close();
   }
 }

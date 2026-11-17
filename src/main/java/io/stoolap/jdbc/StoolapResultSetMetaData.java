@@ -19,13 +19,52 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Types;
 
-/** ResultSetMetaData for Stoolap result sets. */
+/**
+ * ResultSetMetaData for Stoolap result sets. A column's type is that of its first non-null value in
+ * the first chunk of the result; a column with no such value reports {@link Types#NULL}.
+ */
 public class StoolapResultSetMetaData implements ResultSetMetaData {
 
   private final String[] columnNames;
+  private final byte[] tags;
 
-  StoolapResultSetMetaData(String[] columnNames) {
+  StoolapResultSetMetaData(String[] columnNames, byte[] tags) {
     this.columnNames = columnNames;
+    this.tags = tags;
+  }
+
+  private int tag(int column) throws SQLException {
+    if (column < 1 || column > columnNames.length) {
+      throw new SQLException("Column index out of range: " + column, "22023");
+    }
+    return tags[column - 1];
+  }
+
+  /** The java.sql.Types code for a packed-format type tag. */
+  static int sqlType(int tag) {
+    return switch (tag) {
+      case 1 -> Types.BIGINT;
+      case 2 -> Types.DOUBLE;
+      case 3 -> Types.VARCHAR;
+      case 4 -> Types.BOOLEAN;
+      case 5 -> Types.TIMESTAMP;
+      case 6, 7 -> Types.OTHER;
+      default -> Types.NULL;
+    };
+  }
+
+  /** The Stoolap type name for a packed-format type tag. */
+  static String typeName(int tag) {
+    return switch (tag) {
+      case 1 -> "INTEGER";
+      case 2 -> "FLOAT";
+      case 3 -> "TEXT";
+      case 4 -> "BOOLEAN";
+      case 5 -> "TIMESTAMP";
+      case 6 -> "JSON";
+      case 7 -> "VECTOR";
+      default -> "NULL";
+    };
   }
 
   @Override
@@ -35,27 +74,36 @@ public class StoolapResultSetMetaData implements ResultSetMetaData {
 
   @Override
   public String getColumnLabel(int column) throws SQLException {
+    tag(column);
     return columnNames[column - 1];
   }
 
   @Override
   public String getColumnName(int column) throws SQLException {
-    return columnNames[column - 1];
+    return getColumnLabel(column);
   }
 
   @Override
   public int getColumnType(int column) throws SQLException {
-    return Types.OTHER;
+    return sqlType(tag(column));
   }
 
   @Override
   public String getColumnTypeName(int column) throws SQLException {
-    return "UNKNOWN";
+    return typeName(tag(column));
   }
 
   @Override
   public String getColumnClassName(int column) throws SQLException {
-    return Object.class.getName();
+    return switch (tag(column)) {
+      case 1 -> Long.class.getName();
+      case 2 -> Double.class.getName();
+      case 3, 6 -> String.class.getName();
+      case 4 -> Boolean.class.getName();
+      case 5 -> java.sql.Timestamp.class.getName();
+      case 7 -> float[].class.getName();
+      default -> Object.class.getName();
+    };
   }
 
   @Override
@@ -65,7 +113,8 @@ public class StoolapResultSetMetaData implements ResultSetMetaData {
 
   @Override
   public boolean isCaseSensitive(int column) throws SQLException {
-    return true;
+    int t = tag(column);
+    return t == 3 || t == 6;
   }
 
   @Override
@@ -80,17 +129,25 @@ public class StoolapResultSetMetaData implements ResultSetMetaData {
 
   @Override
   public int isNullable(int column) throws SQLException {
-    return columnNullable;
+    tag(column);
+    return columnNullableUnknown;
   }
 
   @Override
   public boolean isSigned(int column) throws SQLException {
-    return true;
+    int t = tag(column);
+    return t == 1 || t == 2;
   }
 
   @Override
   public int getColumnDisplaySize(int column) throws SQLException {
-    return 0;
+    return switch (tag(column)) {
+      case 1 -> 20;
+      case 2 -> 24;
+      case 4 -> 5;
+      case 5 -> 35;
+      default -> Integer.MAX_VALUE;
+    };
   }
 
   @Override
@@ -100,12 +157,18 @@ public class StoolapResultSetMetaData implements ResultSetMetaData {
 
   @Override
   public int getPrecision(int column) throws SQLException {
-    return 0;
+    return switch (tag(column)) {
+      case 1 -> 19;
+      case 2 -> 17;
+      case 4 -> 1;
+      case 5 -> 35;
+      default -> 0;
+    };
   }
 
   @Override
   public int getScale(int column) throws SQLException {
-    return 0;
+    return tag(column) == 5 ? 9 : 0;
   }
 
   @Override

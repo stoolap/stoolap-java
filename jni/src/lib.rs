@@ -15,64 +15,155 @@
 //! JNI bindings for the Stoolap database engine.
 //!
 //! Calls `stoolap::api` directly (no C FFI layer). Each Java handle is a
-//! `Box`-ed Rust object stored as a `jlong` pointer. Results are packed in
-//! Rust into one `byte[]` per call (see `BulkDecoder.java`), and parameters
-//! arrive packed the same way (see `ParamEncoder.java`).
+//! `Box`-ed Rust object stored as a `jlong` pointer; the Java side
+//! serialises access to each handle and never frees one in use. Results are
+//! packed in Rust into one `byte[]` per call (see `BulkDecoder.java`), and
+//! parameters arrive packed the same way (see `ParamEncoder.java`).
 
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use chrono::{DateTime, Utc};
-use jni::objects::{JByteArray, JClass, JLongArray, JObject, JString};
+use jni::objects::{JByteArray, JClass, JLongArray, JObject, JString, JThrowable, JValue};
 use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
 use stoolap::api::{
     Database, NamedParams, ParamVec, Rows, Statement, Transaction as ApiTransaction,
 };
-use stoolap::{DataType, IsolationLevel, Value};
-
-/// A prepared statement with a database clone that keeps its engine open
-/// for as long as the statement lives.
-pub struct PreparedStmt {
-    stmt: Statement,
-    _db: Database,
-}
+use stoolap::parser::ast::{RollbackStatement, Statement as Ast};
+use stoolap::parser::Parser;
+use stoolap::{DataType, Error, IsolationLevel, Value};
 
 /// A result read in chunks. `rows` is `None` once the result is exhausted.
 pub struct Cursor {
     rows: Option<Rows>,
     columns: Vec<String>,
+    affected: i64,
 }
 
-type R<T> = Result<T, String>;
+// ============================================================
+// Errors
+// ============================================================
 
-// ============================================================
-// Error plumbing
-// ============================================================
+/// An error for Java: its message and, when known, its SQLState.
+#[derive(Debug)]
+struct Fail {
+    msg: String,
+    state: Option<&'static str>,
+}
+
+type R<T> = Result<T, Fail>;
+
+impl From<String> for Fail {
+    fn from(msg: String) -> Self {
+        Fail { msg, state: None }
+    }
+}
+
+impl From<&str> for Fail {
+    fn from(msg: &str) -> Self {
+        msg.to_string().into()
+    }
+}
+
+impl From<Error> for Fail {
+    fn from(e: Error) -> Self {
+        let state = sqlstate(&e);
+        Fail {
+            msg: e.to_string(),
+            state,
+        }
+    }
+}
+
+impl From<jni::errors::Error> for Fail {
+    fn from(e: jni::errors::Error) -> Self {
+        e.to_string().into()
+    }
+}
+
+/// The SQLState of an engine error, so callers can tell a constraint
+/// violation from a conflict worth retrying.
+fn sqlstate(e: &Error) -> Option<&'static str> {
+    Some(match e {
+        Error::Parse(_) => "42601",
+        Error::TableNotFound(_) | Error::TableOrViewNotFound(_) | Error::ViewNotFound(_) => "42P01",
+        Error::ColumnNotFound(_) => "42703",
+        Error::IndexNotFound(_) => "42704",
+        Error::TableAlreadyExists(_)
+        | Error::ViewAlreadyExists(_)
+        | Error::IndexAlreadyExists(_)
+        | Error::DuplicateColumn => "42P07",
+        Error::NotNullConstraint { .. } => "23502",
+        Error::PrimaryKeyConstraint { .. } | Error::UniqueConstraint { .. } => "23505",
+        Error::ForeignKeyViolation { .. } => "23503",
+        Error::CheckConstraintViolation { .. } | Error::TableCheckViolation { .. } => "23514",
+        Error::DivisionByZero => "22012",
+        Error::ValueTooLong { .. } => "22001",
+        Error::TypeConversion { .. } => "22018",
+        Error::Type(_) | Error::InvalidValue | Error::VectorDimensionMismatch { .. } => "22000",
+        Error::InvalidArgument(_) => "22023",
+        Error::TransactionNotStarted
+        | Error::TransactionAlreadyStarted
+        | Error::TransactionEnded
+        | Error::TransactionCommitted
+        | Error::TransactionClosed => "25000",
+        Error::TransactionAborted => "40000",
+        Error::QueryCancelled => "57014",
+        Error::DatabaseLocked => "55P03",
+        Error::NotSupported(_) => "0A000",
+        Error::Internal { message } if message.starts_with("write conflict") => "40001",
+        // The insert path reports a NOT NULL violation as an internal error
+        Error::Internal { message } if message.starts_with("NULL value in non-nullable column") => {
+            "23502"
+        }
+        _ => return None,
+    })
+}
+
+/// Throws `fail` as a `java.sql.SQLException` carrying its SQLState.
+fn throw(env: &mut JNIEnv, fail: &Fail) {
+    let thrown = (|| -> jni::errors::Result<()> {
+        let msg = JObject::from(env.new_string(&fail.msg)?);
+        let state = match fail.state {
+            Some(s) => JObject::from(env.new_string(s)?),
+            None => JObject::null(),
+        };
+        let ex = env.new_object(
+            "java/sql/SQLException",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(&msg), JValue::Object(&state)],
+        )?;
+        env.throw(JThrowable::from(ex))
+    })();
+    if thrown.is_err() && !env.exception_check().unwrap_or(false) {
+        let _ = env.throw_new("java/sql/SQLException", &fail.msg);
+    }
+}
 
 /// Runs `f`, turning an `Err` or a panic into a Java `SQLException` and
 /// returning `default` in its place. A panic must never unwind into the JVM.
 fn run<'a, T>(env: &mut JNIEnv<'a>, default: T, f: impl FnOnce(&mut JNIEnv<'a>) -> R<T>) -> T {
-    let msg = match catch_unwind(AssertUnwindSafe(|| f(env))) {
+    let fail = match catch_unwind(AssertUnwindSafe(|| f(env))) {
         Ok(Ok(v)) => return v,
-        Ok(Err(msg)) => msg,
-        Err(_) => "internal error: the native driver panicked".to_string(),
+        Ok(Err(fail)) => fail,
+        Err(_) => "internal error: the native driver panicked".into(),
     };
     if !env.exception_check().unwrap_or(false) {
-        let _ = env.throw_new("java/sql/SQLException", msg);
+        throw(env, &fail);
     }
     default
 }
 
-fn err(e: impl ToString) -> String {
-    e.to_string()
-}
+// ============================================================
+// Handles
+// ============================================================
 
 /// Borrows the object behind a handle, refusing a closed (zero) handle.
 unsafe fn handle<'h, T>(ptr: jlong, what: &str) -> R<&'h T> {
     if ptr == 0 {
-        return Err(format!("{what} is closed"));
+        return Err(format!("{what} is closed").into());
     }
     Ok(unsafe { &*(ptr as *const T) })
 }
@@ -80,7 +171,7 @@ unsafe fn handle<'h, T>(ptr: jlong, what: &str) -> R<&'h T> {
 /// Mutably borrows the object behind a handle, refusing a closed handle.
 unsafe fn handle_mut<'h, T>(ptr: jlong, what: &str) -> R<&'h mut T> {
     if ptr == 0 {
-        return Err(format!("{what} is closed"));
+        return Err(format!("{what} is closed").into());
     }
     Ok(unsafe { &mut *(ptr as *mut T) })
 }
@@ -89,10 +180,12 @@ fn into_handle<T>(v: T) -> jlong {
     Box::into_raw(Box::new(v)) as jlong
 }
 
-/// Drops the object behind a handle; a zero handle is ignored.
+/// Drops the object behind a handle; a zero handle is ignored. A panic in
+/// a destructor is swallowed, since it must not unwind into the JVM.
 unsafe fn drop_handle<T>(ptr: jlong) {
     if ptr != 0 {
-        drop(unsafe { Box::from_raw(ptr as *mut T) });
+        let boxed = unsafe { Box::from_raw(ptr as *mut T) };
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(boxed)));
     }
 }
 
@@ -100,7 +193,7 @@ fn jstring(env: &mut JNIEnv, s: &JString) -> R<String> {
     if s.is_null() {
         return Err("SQL must not be null".into());
     }
-    env.get_string(s).map(Into::into).map_err(err)
+    Ok(env.get_string(s)?.into())
 }
 
 // ============================================================
@@ -143,6 +236,12 @@ impl<'b> Reader<'b> {
         Ok(bytes)
     }
 
+    /// An announced element count, capped for allocation at the bytes left,
+    /// since every element takes at least one
+    fn count(&mut self, announced: usize) -> usize {
+        announced.min(self.data.len() - self.pos)
+    }
+
     fn u8(&mut self) -> R<u8> {
         Ok(self.take(1)?[0])
     }
@@ -157,7 +256,8 @@ impl<'b> Reader<'b> {
 
     fn str(&mut self) -> R<&'b str> {
         let len = self.u32()? as usize;
-        std::str::from_utf8(self.take(len)?).map_err(|_| "parameter text is not valid UTF-8".into())
+        std::str::from_utf8(self.take(len)?)
+            .map_err(|_| Fail::from("parameter text is not valid UTF-8"))
     }
 
     fn value(&mut self) -> R<Value> {
@@ -181,21 +281,22 @@ impl<'b> Reader<'b> {
                         .collect(),
                 )
             }
-            tag => return Err(format!("unknown parameter type tag {tag}")),
+            tag => return Err(format!("unknown parameter type tag {tag}").into()),
         })
     }
 
     fn params(&mut self) -> R<Params> {
         let head = self.u32()?;
         let count = (head & !NAMED_FLAG) as usize;
+        let capacity = self.count(count);
         if head & NAMED_FLAG == 0 {
-            let mut values = ParamVec::with_capacity(count);
+            let mut values = ParamVec::with_capacity(capacity);
             for _ in 0..count {
                 values.push(self.value()?);
             }
             return Ok(Params::Positional(values));
         }
-        let mut named = NamedParams::with_capacity(count);
+        let mut named = NamedParams::with_capacity(capacity);
         for _ in 0..count {
             let name = self.str()?.trim_start_matches([':', '@', '$']).to_string();
             let value = self.value()?;
@@ -217,7 +318,7 @@ fn params(env: &mut JNIEnv, bin: &JByteArray) -> R<Params> {
     if bin.is_null() {
         return Ok(Params::none());
     }
-    let bytes = env.convert_byte_array(bin).map_err(err)?;
+    let bytes = env.convert_byte_array(bin)?;
     let mut r = Reader::new(&bytes);
     let p = r.params()?;
     r.finish()?;
@@ -229,10 +330,10 @@ fn batch(env: &mut JNIEnv, bin: &JByteArray) -> R<Vec<Params>> {
     if bin.is_null() {
         return Err("batch must not be null".into());
     }
-    let bytes = env.convert_byte_array(bin).map_err(err)?;
+    let bytes = env.convert_byte_array(bin)?;
     let mut r = Reader::new(&bytes);
     let rows = r.u32()? as usize;
-    let mut all = Vec::with_capacity(rows.min(bytes.len()));
+    let mut all = Vec::with_capacity(r.count(rows));
     for _ in 0..rows {
         all.push(r.params()?);
     }
@@ -244,15 +345,17 @@ fn batch(env: &mut JNIEnv, bin: &JByteArray) -> R<Vec<Params>> {
 // Running statements
 // ============================================================
 
-fn db_exec(db: &Database, sql: &str, p: Params) -> stoolap::Result<i64> {
+fn db_exec(db: &Database, sql: &str, p: Params, timeout_ms: u64) -> stoolap::Result<i64> {
     match p {
+        Params::Positional(v) if timeout_ms > 0 => db.execute_with_timeout(sql, v, timeout_ms),
         Params::Positional(v) => db.execute(sql, v),
         Params::Named(n) => db.execute_named(sql, n),
     }
 }
 
-fn db_query(db: &Database, sql: &str, p: Params) -> stoolap::Result<Rows> {
+fn db_query(db: &Database, sql: &str, p: Params, timeout_ms: u64) -> stoolap::Result<Rows> {
     match p {
+        Params::Positional(v) if timeout_ms > 0 => db.query_with_timeout(sql, v, timeout_ms),
         Params::Positional(v) => db.query(sql, v),
         Params::Named(n) => db.query_named(sql, n),
     }
@@ -295,15 +398,89 @@ fn stmt_query(s: &Statement, tx: Option<&mut ApiTransaction>, p: Params) -> stoo
 fn stmt_batch(s: &Statement, tx: &mut ApiTransaction, all: Vec<Params>) -> R<Vec<i64>> {
     let mut counts = Vec::with_capacity(all.len());
     for (i, p) in all.into_iter().enumerate() {
-        counts.push(stmt_exec(s, Some(tx), p).map_err(|e| format!("batch row {i}: {e}"))?);
+        match stmt_exec(s, Some(tx), p) {
+            Ok(n) => counts.push(n),
+            Err(e) => {
+                let mut fail = Fail::from(e);
+                fail.msg = format!("batch row {i}: {}", fail.msg);
+                return Err(fail);
+            }
+        }
     }
     Ok(counts)
 }
 
 fn long_array<'a>(env: &mut JNIEnv<'a>, values: &[i64]) -> R<JLongArray<'a>> {
-    let arr = env.new_long_array(values.len() as i32).map_err(err)?;
-    env.set_long_array_region(&arr, 0, values).map_err(err)?;
+    let arr = env.new_long_array(values.len() as i32)?;
+    env.set_long_array_region(&arr, 0, values)?;
     Ok(arr)
+}
+
+/// Where a manual-commit (JDBC) connection runs `sql`, as the code
+/// `NativeBridge.placement` returns:
+/// - `IN_TX` (0): inside the open transaction: DML and savepoints, which
+///   is all an engine transaction accepts.
+/// - `COMMIT_FIRST` (1): outside, after committing the open transaction:
+///   DDL and anything else that changes the database outside a transaction.
+/// - `OUTSIDE` (2): outside, leaving the transaction open: statements that
+///   only read the catalog or a plan (SHOW, DESCRIBE, EXPLAIN without
+///   ANALYZE of a write).
+/// - `COMMIT` (3): BEGIN or COMMIT, which commit the open transaction.
+/// - `ROLLBACK` (4): ROLLBACK, which rolls the open transaction back.
+///
+/// SQL that does not parse is placed in the transaction, so running it
+/// reports the parse error. A script of several statements runs in the
+/// transaction only when all of them may, and outside without committing
+/// only when all of them only read.
+fn placement(sql: &str) -> i32 {
+    const IN_TX: i32 = 0;
+    const COMMIT_FIRST: i32 = 1;
+    const OUTSIDE: i32 = 2;
+    const COMMIT: i32 = 3;
+    const ROLLBACK: i32 = 4;
+
+    fn one(s: &Ast) -> i32 {
+        match s {
+            Ast::Select(_)
+            | Ast::Insert(_)
+            | Ast::Update(_)
+            | Ast::Delete(_)
+            | Ast::Savepoint(_)
+            | Ast::ReleaseSavepoint(_)
+            | Ast::Rollback(RollbackStatement {
+                savepoint_name: Some(_),
+                ..
+            }) => IN_TX,
+            Ast::ShowTables(_)
+            | Ast::ShowViews(_)
+            | Ast::ShowCreateTable(_)
+            | Ast::ShowCreateView(_)
+            | Ast::ShowIndexes(_)
+            | Ast::Describe(_) => OUTSIDE,
+            Ast::Explain(e) if !e.analyze || matches!(*e.statement, Ast::Select(_)) => OUTSIDE,
+            Ast::Begin(_) | Ast::Commit(_) => COMMIT,
+            Ast::Rollback(_) => ROLLBACK,
+            _ => COMMIT_FIRST,
+        }
+    }
+
+    let Ok(program) = Parser::new(sql).parse_program() else {
+        return IN_TX;
+    };
+    match program.statements.as_slice() {
+        [] => IN_TX,
+        [s] => one(s),
+        all => {
+            let each: Vec<i32> = all.iter().map(one).collect();
+            if each.iter().all(|&p| p == IN_TX) {
+                IN_TX
+            } else if each.iter().all(|&p| p == OUTSIDE) {
+                OUTSIDE
+            } else {
+                COMMIT_FIRST
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -323,12 +500,12 @@ fn write_header(columns: &[String], buf: &mut Vec<u8>) -> R<usize> {
     buf.extend_from_slice(&(columns.len() as u32).to_le_bytes());
     for name in columns {
         let len = u16::try_from(name.len()).map_err(|_| {
-            format!(
+            Fail::from(format!(
                 "a result column name takes {} bytes, more than the {} the packed format \
                  carries; give the column an alias",
                 name.len(),
                 u16::MAX
-            )
+            ))
         })?;
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(name.as_bytes());
@@ -362,10 +539,10 @@ fn write_value(val: &Value, buf: &mut Vec<u8>) -> R<()> {
         }
         Value::Timestamp(ts) => {
             let nanos = ts.timestamp_nanos_opt().ok_or_else(|| {
-                format!(
+                Fail::from(format!(
                     "TIMESTAMP {ts} is outside the range 1677-09-21 00:12:43.145224192 to \
                      2262-04-11 23:47:16.854775807"
-                )
+                ))
             })?;
             buf.push(5);
             buf.extend_from_slice(&nanos.to_le_bytes());
@@ -374,7 +551,7 @@ fn write_value(val: &Value, buf: &mut Vec<u8>) -> R<()> {
             None => buf.push(0),
             Some(&t) if t == DataType::Json as u8 => write_bytes(6, &data[1..], buf),
             Some(&t) if t == DataType::Vector as u8 => write_bytes(7, &data[1..], buf),
-            Some(&t) => return Err(format!("unsupported result value type {t}")),
+            Some(&t) => return Err(format!("unsupported result value type {t}").into()),
         },
     }
     Ok(())
@@ -398,7 +575,7 @@ fn write_rows(rows: &mut Rows, max_rows: usize, count_at: usize, buf: &mut Vec<u
     }
     if n < max_rows {
         if let Some(e) = rows.error() {
-            return Err(e.to_string());
+            return Err(e.into());
         }
     }
     let count = u32::try_from(n).map_err(|_| "result has more than 4294967295 rows")?;
@@ -415,27 +592,74 @@ fn packed<'a>(env: &mut JNIEnv<'a>, fill: impl FnOnce(&mut Vec<u8>) -> R<()>) ->
         }
         buf.clear();
         fill(&mut buf)?;
-        env.byte_array_from_slice(&buf).map_err(err)
+        Ok(env.byte_array_from_slice(&buf)?)
     })
 }
 
-/// Packs a whole query result.
+/// Packs a whole query result, followed by its rows affected.
 fn pack_all<'a>(env: &mut JNIEnv<'a>, rows: stoolap::Result<Rows>) -> R<JByteArray<'a>> {
-    let mut rows = rows.map_err(err)?;
+    let mut rows = rows?;
     packed(env, |buf| {
         let count_at = write_header(rows.columns(), buf)?;
         write_rows(&mut rows, usize::MAX, count_at, buf)?;
+        buf.extend_from_slice(&rows.rows_affected().to_le_bytes());
         Ok(())
     })
 }
 
-fn open_cursor(rows: stoolap::Result<Rows>) -> R<jlong> {
-    let rows = rows.map_err(err)?;
-    let columns = rows.columns().to_vec();
-    Ok(into_handle(Cursor {
-        rows: Some(rows),
-        columns,
-    }))
+/// Packs the next chunk of `c` into `buf`, followed by the rows affected,
+/// dropping the result once a chunk comes back short.
+fn write_chunk(c: &mut Cursor, max: usize, buf: &mut Vec<u8>) -> R<()> {
+    let count_at = write_header(&c.columns, buf)?;
+    if let Some(r) = &mut c.rows {
+        match write_rows(r, max, count_at, buf) {
+            Ok(n) if n == max => {}
+            Ok(_) => c.rows = None,
+            Err(e) => {
+                c.rows = None;
+                return Err(e);
+            }
+        }
+    }
+    buf.extend_from_slice(&c.affected.to_le_bytes());
+    Ok(())
+}
+
+/// Opens a cursor over `rows` and packs its first chunk behind the cursor
+/// handle: `[handle:i64][chunk]`. When the first chunk holds the whole
+/// result the handle is 0 and nothing stays open.
+fn open_cursor<'a>(
+    env: &mut JNIEnv<'a>,
+    rows: stoolap::Result<Rows>,
+    max_rows: jint,
+) -> R<JByteArray<'a>> {
+    if max_rows <= 0 {
+        return Err("max_rows must be positive".into());
+    }
+    let mut rows = rows?;
+    let max = max_rows as usize;
+    let mut handle = 0;
+    let out = packed(env, |buf| {
+        buf.extend_from_slice(&0i64.to_le_bytes());
+        let count_at = write_header(rows.columns(), buf)?;
+        let n = write_rows(&mut rows, max, count_at, buf)?;
+        let affected = rows.rows_affected();
+        buf.extend_from_slice(&affected.to_le_bytes());
+        // Only a result with rows left keeps a cursor, and its column names
+        if n == max {
+            handle = into_handle(Cursor {
+                columns: rows.columns().to_vec(),
+                affected,
+                rows: Some(rows),
+            });
+            buf[..8].copy_from_slice(&handle.to_le_bytes());
+        }
+        Ok(())
+    });
+    if out.is_err() {
+        unsafe { drop_handle::<Cursor>(handle) };
+    }
+    out
 }
 
 // ============================================================
@@ -450,7 +674,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_open(
 ) -> jlong {
     run(&mut env, 0, |env| {
         let dsn = jstring(env, &dsn)?;
-        Database::open(&dsn).map(into_handle).map_err(err)
+        Ok(into_handle(Database::open(&dsn)?))
     })
 }
 
@@ -460,7 +684,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_openInMemory(
     _class: JClass,
 ) -> jlong {
     run(&mut env, 0, |_| {
-        Database::open_in_memory().map(into_handle).map_err(err)
+        Ok(into_handle(Database::open_in_memory()?))
     })
 }
 
@@ -496,23 +720,21 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_version<'a>(
     }
 }
 
+#[no_mangle]
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_placement(
+    mut env: JNIEnv,
+    _class: JClass,
+    sql: JString,
+) -> jint {
+    run(&mut env, 0, |env| {
+        let sql = jstring(env, &sql)?;
+        Ok(placement(&sql))
+    })
+}
+
 // ============================================================
 // Database: execute and query
 // ============================================================
-
-#[no_mangle]
-pub extern "system" fn Java_io_stoolap_internal_NativeBridge_exec(
-    mut env: JNIEnv,
-    _class: JClass,
-    ptr: jlong,
-    sql: JString,
-) -> jlong {
-    run(&mut env, -1, |env| {
-        let db = unsafe { handle::<Database>(ptr, "Database")? };
-        let sql = jstring(env, &sql)?;
-        db_exec(db, &sql, Params::none()).map_err(err)
-    })
-}
 
 #[no_mangle]
 pub extern "system" fn Java_io_stoolap_internal_NativeBridge_execParams(
@@ -521,26 +743,13 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_execParams(
     ptr: jlong,
     sql: JString,
     bin: JByteArray,
+    timeout_ms: jint,
 ) -> jlong {
     run(&mut env, -1, |env| {
         let db = unsafe { handle::<Database>(ptr, "Database")? };
         let sql = jstring(env, &sql)?;
         let p = params(env, &bin)?;
-        db_exec(db, &sql, p).map_err(err)
-    })
-}
-
-#[no_mangle]
-pub extern "system" fn Java_io_stoolap_internal_NativeBridge_query<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass,
-    ptr: jlong,
-    sql: JString,
-) -> JByteArray<'a> {
-    run(&mut env, JByteArray::default(), |env| {
-        let db = unsafe { handle::<Database>(ptr, "Database")? };
-        let sql = jstring(env, &sql)?;
-        pack_all(env, db_query(db, &sql, Params::none()))
+        Ok(db_exec(db, &sql, p, timeout_ms.max(0) as u64)?)
     })
 }
 
@@ -556,23 +765,26 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_queryParams<'a>(
         let db = unsafe { handle::<Database>(ptr, "Database")? };
         let sql = jstring(env, &sql)?;
         let p = params(env, &bin)?;
-        pack_all(env, db_query(db, &sql, p))
+        pack_all(env, db_query(db, &sql, p, 0))
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_stoolap_internal_NativeBridge_queryCursor(
-    mut env: JNIEnv,
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_queryCursor<'a>(
+    mut env: JNIEnv<'a>,
     _class: JClass,
     ptr: jlong,
     sql: JString,
     bin: JByteArray,
-) -> jlong {
-    run(&mut env, 0, |env| {
+    max_rows: jint,
+    timeout_ms: jint,
+) -> JByteArray<'a> {
+    run(&mut env, JByteArray::default(), |env| {
         let db = unsafe { handle::<Database>(ptr, "Database")? };
         let sql = jstring(env, &sql)?;
         let p = params(env, &bin)?;
-        open_cursor(db_query(db, &sql, p))
+        let rows = db_query(db, &sql, p, timeout_ms.max(0) as u64);
+        open_cursor(env, rows, max_rows)
     })
 }
 
@@ -590,11 +802,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_prepare(
     run(&mut env, 0, |env| {
         let db = unsafe { handle::<Database>(ptr, "Database")? };
         let sql = jstring(env, &sql)?;
-        let stmt = db.prepare(&sql).map_err(err)?;
-        Ok(into_handle(PreparedStmt {
-            stmt,
-            _db: db.clone(),
-        }))
+        Ok(into_handle(db.prepare(&sql)?))
     })
 }
 
@@ -604,7 +812,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    unsafe { drop_handle::<PreparedStmt>(ptr) }
+    unsafe { drop_handle::<Statement>(ptr) }
 }
 
 #[no_mangle]
@@ -615,9 +823,9 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtExec(
     bin: JByteArray,
 ) -> jlong {
     run(&mut env, -1, |env| {
-        let s = unsafe { handle::<PreparedStmt>(ptr, "Statement")? };
+        let s = unsafe { handle::<Statement>(ptr, "Statement")? };
         let p = params(env, &bin)?;
-        stmt_exec(&s.stmt, None, p).map_err(err)
+        Ok(stmt_exec(s, None, p)?)
     })
 }
 
@@ -629,41 +837,45 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtQuery<'a>(
     bin: JByteArray,
 ) -> JByteArray<'a> {
     run(&mut env, JByteArray::default(), |env| {
-        let s = unsafe { handle::<PreparedStmt>(ptr, "Statement")? };
+        let s = unsafe { handle::<Statement>(ptr, "Statement")? };
         let p = params(env, &bin)?;
-        pack_all(env, stmt_query(&s.stmt, None, p))
+        pack_all(env, stmt_query(s, None, p))
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtQueryCursor(
-    mut env: JNIEnv,
-    _class: JClass,
-    ptr: jlong,
-    bin: JByteArray,
-) -> jlong {
-    run(&mut env, 0, |env| {
-        let s = unsafe { handle::<PreparedStmt>(ptr, "Statement")? };
-        let p = params(env, &bin)?;
-        open_cursor(stmt_query(&s.stmt, None, p))
-    })
-}
-
-/// Runs every row of a batch in one transaction of its own: all rows
-/// commit together, or none do.
-#[no_mangle]
-pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtExecBatch<'a>(
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtQueryCursor<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass,
     ptr: jlong,
     bin: JByteArray,
+    max_rows: jint,
+) -> JByteArray<'a> {
+    run(&mut env, JByteArray::default(), |env| {
+        let s = unsafe { handle::<Statement>(ptr, "Statement")? };
+        let p = params(env, &bin)?;
+        let rows = stmt_query(s, None, p);
+        open_cursor(env, rows, max_rows)
+    })
+}
+
+/// Runs every row of a batch in one transaction of its own on `db`: all
+/// rows commit together, or none do.
+#[no_mangle]
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_stmtExecBatch<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    db_ptr: jlong,
+    stmt_ptr: jlong,
+    bin: JByteArray,
 ) -> JLongArray<'a> {
     run(&mut env, JLongArray::default(), |env| {
-        let s = unsafe { handle::<PreparedStmt>(ptr, "Statement")? };
+        let db = unsafe { handle::<Database>(db_ptr, "Database")? };
+        let s = unsafe { handle::<Statement>(stmt_ptr, "Statement")? };
         let all = batch(env, &bin)?;
-        let mut tx = s._db.begin().map_err(err)?;
-        let counts = stmt_batch(&s.stmt, &mut tx, all)?; // dropping tx rolls back
-        tx.commit().map_err(err)?;
+        let mut tx = db.begin()?;
+        let counts = stmt_batch(s, &mut tx, all)?; // dropping tx rolls back
+        tx.commit()?;
         long_array(env, &counts)
     })
 }
@@ -685,7 +897,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_begin(
             1 => IsolationLevel::SnapshotIsolation,
             _ => IsolationLevel::ReadCommitted,
         };
-        db.begin_with_isolation(level).map(into_handle).map_err(err)
+        Ok(into_handle(db.begin_with_isolation(level)?))
     })
 }
 
@@ -697,7 +909,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txCommit(
 ) -> jboolean {
     run(&mut env, JNI_FALSE, |_| {
         let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
-        tx.commit().map_err(err)?;
+        tx.commit()?;
         Ok(JNI_TRUE)
     })
 }
@@ -710,7 +922,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txRollback(
 ) -> jboolean {
     run(&mut env, JNI_FALSE, |_| {
         let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
-        tx.rollback().map_err(err)?;
+        tx.rollback()?;
         Ok(JNI_TRUE)
     })
 }
@@ -725,20 +937,6 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txClose(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txExec(
-    mut env: JNIEnv,
-    _class: JClass,
-    ptr: jlong,
-    sql: JString,
-) -> jlong {
-    run(&mut env, -1, |env| {
-        let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
-        let sql = jstring(env, &sql)?;
-        tx_exec(tx, &sql, Params::none()).map_err(err)
-    })
-}
-
-#[no_mangle]
 pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txExecParams(
     mut env: JNIEnv,
     _class: JClass,
@@ -750,21 +948,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txExecParams(
         let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
         let sql = jstring(env, &sql)?;
         let p = params(env, &bin)?;
-        tx_exec(tx, &sql, p).map_err(err)
-    })
-}
-
-#[no_mangle]
-pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txQuery<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass,
-    ptr: jlong,
-    sql: JString,
-) -> JByteArray<'a> {
-    run(&mut env, JByteArray::default(), |env| {
-        let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
-        let sql = jstring(env, &sql)?;
-        pack_all(env, tx_query(tx, &sql, Params::none()))
+        Ok(tx_exec(tx, &sql, p)?)
     })
 }
 
@@ -785,18 +969,20 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txQueryParams<'a>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txQueryCursor(
-    mut env: JNIEnv,
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txQueryCursor<'a>(
+    mut env: JNIEnv<'a>,
     _class: JClass,
     ptr: jlong,
     sql: JString,
     bin: JByteArray,
-) -> jlong {
-    run(&mut env, 0, |env| {
+    max_rows: jint,
+) -> JByteArray<'a> {
+    run(&mut env, JByteArray::default(), |env| {
         let tx = unsafe { handle_mut::<ApiTransaction>(ptr, "Transaction")? };
         let sql = jstring(env, &sql)?;
         let p = params(env, &bin)?;
-        open_cursor(tx_query(tx, &sql, p))
+        let rows = tx_query(tx, &sql, p);
+        open_cursor(env, rows, max_rows)
     })
 }
 
@@ -810,9 +996,9 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txStmtExec(
 ) -> jlong {
     run(&mut env, -1, |env| {
         let tx = unsafe { handle_mut::<ApiTransaction>(tx_ptr, "Transaction")? };
-        let s = unsafe { handle::<PreparedStmt>(stmt_ptr, "Statement")? };
+        let s = unsafe { handle::<Statement>(stmt_ptr, "Statement")? };
         let p = params(env, &bin)?;
-        stmt_exec(&s.stmt, Some(tx), p).map_err(err)
+        Ok(stmt_exec(s, Some(tx), p)?)
     })
 }
 
@@ -826,25 +1012,27 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txStmtQuery<'a>(
 ) -> JByteArray<'a> {
     run(&mut env, JByteArray::default(), |env| {
         let tx = unsafe { handle_mut::<ApiTransaction>(tx_ptr, "Transaction")? };
-        let s = unsafe { handle::<PreparedStmt>(stmt_ptr, "Statement")? };
+        let s = unsafe { handle::<Statement>(stmt_ptr, "Statement")? };
         let p = params(env, &bin)?;
-        pack_all(env, stmt_query(&s.stmt, Some(tx), p))
+        pack_all(env, stmt_query(s, Some(tx), p))
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txStmtQueryCursor(
-    mut env: JNIEnv,
+pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txStmtQueryCursor<'a>(
+    mut env: JNIEnv<'a>,
     _class: JClass,
     tx_ptr: jlong,
     stmt_ptr: jlong,
     bin: JByteArray,
-) -> jlong {
-    run(&mut env, 0, |env| {
+    max_rows: jint,
+) -> JByteArray<'a> {
+    run(&mut env, JByteArray::default(), |env| {
         let tx = unsafe { handle_mut::<ApiTransaction>(tx_ptr, "Transaction")? };
-        let s = unsafe { handle::<PreparedStmt>(stmt_ptr, "Statement")? };
+        let s = unsafe { handle::<Statement>(stmt_ptr, "Statement")? };
         let p = params(env, &bin)?;
-        open_cursor(stmt_query(&s.stmt, Some(tx), p))
+        let rows = stmt_query(s, Some(tx), p);
+        open_cursor(env, rows, max_rows)
     })
 }
 
@@ -859,9 +1047,9 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_txStmtExecBatch<'a>
 ) -> JLongArray<'a> {
     run(&mut env, JLongArray::default(), |env| {
         let tx = unsafe { handle_mut::<ApiTransaction>(tx_ptr, "Transaction")? };
-        let s = unsafe { handle::<PreparedStmt>(stmt_ptr, "Statement")? };
+        let s = unsafe { handle::<Statement>(stmt_ptr, "Statement")? };
         let all = batch(env, &bin)?;
-        let counts = stmt_batch(&s.stmt, tx, all)?;
+        let counts = stmt_batch(s, tx, all)?;
         long_array(env, &counts)
     })
 }
@@ -884,23 +1072,7 @@ pub extern "system" fn Java_io_stoolap_internal_NativeBridge_cursorFetch<'a>(
         if max_rows <= 0 {
             return Err("max_rows must be positive".into());
         }
-        let max = max_rows as usize;
-        let columns = &c.columns;
-        let rows = &mut c.rows;
-        packed(env, |buf| {
-            let count_at = write_header(columns, buf)?;
-            if let Some(r) = rows {
-                match write_rows(r, max, count_at, buf) {
-                    Ok(n) if n == max => {}
-                    Ok(_) => *rows = None,
-                    Err(e) => {
-                        *rows = None;
-                        return Err(e);
-                    }
-                }
-            }
-            Ok(())
-        })
+        packed(env, |buf| write_chunk(c, max_rows as usize, buf))
     })
 }
 
@@ -936,6 +1108,8 @@ mod tests {
         assert!(decode(&[0, 0, 0, 0, 9]).is_err());
         // A length that would overflow the buffer position
         assert!(decode(&[1, 0, 0, 0, 3, 0xff, 0xff, 0xff, 0xff]).is_err());
+        // A count far beyond the bytes present must not allocate for it
+        assert!(decode(&[0xff, 0xff, 0xff, 0x7f]).is_err());
     }
 
     #[test]
@@ -949,6 +1123,40 @@ mod tests {
         match decode(&b).unwrap() {
             Params::Named(n) => assert_eq!(n.as_map().get("id"), Some(&Value::Integer(7))),
             Params::Positional(_) => panic!("expected named parameters"),
+        }
+    }
+
+    #[test]
+    fn places_statements_for_a_manual_commit_connection() {
+        for (sql, want) in [
+            ("SELECT 1", 0),
+            ("INSERT INTO t VALUES (1)", 0),
+            ("UPDATE t SET a = 1", 0),
+            ("DELETE FROM t", 0),
+            ("SAVEPOINT s", 0),
+            ("RELEASE SAVEPOINT s", 0),
+            ("ROLLBACK TO SAVEPOINT s", 0),
+            ("SELEC broken", 0),
+            ("SELECT 1; INSERT INTO t VALUES (1)", 0),
+            ("CREATE TABLE t (a INTEGER)", 1),
+            ("DROP TABLE t", 1),
+            ("ALTER TABLE t ADD COLUMN b TEXT", 1),
+            ("CREATE INDEX i ON t(a)", 1),
+            ("TRUNCATE TABLE t", 1),
+            ("PRAGMA snapshot", 1),
+            ("EXPLAIN ANALYZE DELETE FROM t", 1),
+            ("SELECT 1; CREATE TABLE u (a INTEGER)", 1),
+            ("SHOW TABLES", 2),
+            ("SHOW INDEXES FROM t", 2),
+            ("DESCRIBE t", 2),
+            ("EXPLAIN SELECT 1", 2),
+            ("EXPLAIN ANALYZE SELECT 1", 2),
+            ("SHOW TABLES; DESCRIBE t", 2),
+            ("BEGIN", 3),
+            ("COMMIT", 3),
+            ("ROLLBACK", 4),
+        ] {
+            assert_eq!(placement(sql), want, "{sql}");
         }
     }
 }

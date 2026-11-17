@@ -16,103 +16,98 @@
 package io.stoolap;
 
 import io.stoolap.internal.BulkDecoder;
+import io.stoolap.internal.ChunkReader;
 import io.stoolap.internal.NativeBridge;
+import io.stoolap.internal.NativeHandle;
 import io.stoolap.internal.ParamEncoder;
 import java.util.Map;
 
-/** A prepared SQL statement backed by a Rust {@code Box<Statement>}. */
+/**
+ * A prepared statement backed by a Rust {@code stoolap::api::Statement}. It runs on its compiled
+ * plan, on the database and inside a {@link StoolapTx}. It is thread-safe, and {@link #close()}
+ * waits for the runs in flight. A statement whose database is closed raises an error when run.
+ */
 public class StoolapStmt implements AutoCloseable {
 
-  private long ptr;
+  private final NativeHandle handle;
   private final String sql;
-  private boolean closed;
+  private final StoolapDB db;
 
-  StoolapStmt(long ptr, String sql) {
-    this.ptr = ptr;
+  StoolapStmt(long ptr, String sql, StoolapDB db) {
+    this.handle = new NativeHandle(this, ptr, NativeBridge::stmtClose, "Statement");
     this.sql = sql;
+    this.db = db;
   }
 
+  /** Executes with positional parameters; returns the rows affected. */
   public long execute(Object... params) throws StoolapException {
-    checkClosed();
-    try {
-      return NativeBridge.stmtExec(ptr, ParamEncoder.encode(params));
-    } catch (Exception e) {
-      throw new StoolapException(e.getMessage(), e);
-    }
-  }
-
-  public BulkDecoder.Result query(Object... params) throws StoolapException {
-    checkClosed();
-    try {
-      byte[] buf = NativeBridge.stmtQuery(ptr, ParamEncoder.encode(params));
-      return BulkDecoder.decode(buf);
-    } catch (Exception e) {
-      throw new StoolapException(e.getMessage(), e);
-    }
+    return handle.shared(p -> NativeBridge.stmtExec(p, ParamEncoder.encode(params)));
   }
 
   /** Executes with named parameters ({@code :name}); returns the rows affected. */
   public long execute(Map<String, ?> params) throws StoolapException {
-    checkClosed();
-    try {
-      return NativeBridge.stmtExec(ptr, ParamEncoder.encode(params));
-    } catch (Exception e) {
-      throw new StoolapException(e.getMessage(), e);
-    }
+    return handle.shared(p -> NativeBridge.stmtExec(p, ParamEncoder.encode(params)));
+  }
+
+  /** Queries with positional parameters. */
+  public BulkDecoder.Result query(Object... params) throws StoolapException {
+    return BulkDecoder.decode(
+        handle.shared(p -> NativeBridge.stmtQuery(p, ParamEncoder.encode(params))));
   }
 
   /** Queries with named parameters ({@code :name}). */
   public BulkDecoder.Result query(Map<String, ?> params) throws StoolapException {
-    checkClosed();
-    try {
-      return BulkDecoder.decode(NativeBridge.stmtQuery(ptr, ParamEncoder.encode(params)));
-    } catch (Exception e) {
-      throw new StoolapException(e.getMessage(), e);
-    }
+    return BulkDecoder.decode(
+        handle.shared(p -> NativeBridge.stmtQuery(p, ParamEncoder.encode(params))));
   }
 
   /** Queries with positional parameters, reading the result in chunks. */
   public StoolapCursor cursor(Object... params) throws StoolapException {
-    checkClosed();
-    try {
-      return new StoolapCursor(NativeBridge.stmtQueryCursor(ptr, ParamEncoder.encode(params)));
-    } catch (StoolapException e) {
-      throw e;
-    } catch (Exception e) {
-      throw new StoolapException(e.getMessage(), e);
-    }
+    return new StoolapCursor(
+        handle.shared(
+            p ->
+                new ChunkReader(
+                    NativeBridge.stmtQueryCursor(
+                        p, ParamEncoder.encode(params), StoolapDB.CHUNK_SIZE),
+                    StoolapDB.CHUNK_SIZE)));
   }
 
   /** Queries with named parameters, reading the result in chunks. */
   public StoolapCursor cursor(Map<String, ?> params) throws StoolapException {
-    checkClosed();
-    try {
-      return new StoolapCursor(NativeBridge.stmtQueryCursor(ptr, ParamEncoder.encode(params)));
-    } catch (StoolapException e) {
-      throw e;
-    } catch (Exception e) {
-      throw new StoolapException(e.getMessage(), e);
-    }
+    return new StoolapCursor(
+        handle.shared(
+            p ->
+                new ChunkReader(
+                    NativeBridge.stmtQueryCursor(
+                        p, ParamEncoder.encode(params), StoolapDB.CHUNK_SIZE),
+                    StoolapDB.CHUNK_SIZE)));
   }
 
   public String getSql() {
     return sql;
   }
 
-  public long ptr() {
-    return ptr;
+  /** The database this statement was prepared on. */
+  public StoolapDB database() {
+    return db;
   }
 
+  /**
+   * The native handle. Internal: for the JDBC driver, not part of the public API.
+   *
+   * @hidden
+   */
+  public NativeHandle handle() {
+    return handle;
+  }
+
+  /** Closes the statement once its runs in flight finish. Idempotent. */
   @Override
   public void close() {
-    if (!closed) {
-      closed = true;
-      NativeBridge.stmtClose(ptr);
-      ptr = 0;
-    }
+    handle.close();
   }
 
-  private void checkClosed() throws StoolapException {
-    if (closed) throw new StoolapException("Statement is closed");
+  public boolean isClosed() {
+    return handle.isClosed();
   }
 }

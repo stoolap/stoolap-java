@@ -24,7 +24,19 @@ public class StoolapException extends SQLException {
     super(message);
   }
 
+  public StoolapException(String message, String sqlState) {
+    super(message, sqlState);
+  }
+
+  /** Keeps the SQLState of {@code cause} when it is a {@link SQLException}. */
   public StoolapException(String message, Throwable cause) {
-    super(message, cause);
+    super(message, cause instanceof SQLException s ? s.getSQLState() : null, cause);
+  }
+
+  /** {@code e} itself when it is a StoolapException, else a StoolapException wrapping it. */
+  public static StoolapException of(Exception e) {
+    if (e instanceof StoolapException s) return s;
+    if (e instanceof SQLException s) return new StoolapException(s.getMessage(), s);
+    return new StoolapException(String.valueOf(e.getMessage()), e);
   }
 }

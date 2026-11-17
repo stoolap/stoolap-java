@@ -91,8 +91,7 @@ class DriverFeaturesTest {
       try (StoolapTx tx = db.begin()) {
         assertEquals(1, tx.execute(ins, Map.of("id", 5, "name", "Eve", "age", 22)));
         assertEquals("Eve", tx.query(byId, Map.of("id", 5)).rows().get(0)[0]);
-        assertEquals(
-            1, tx.execute("DELETE FROM users WHERE name = :name", Map.of("name", "Dan")));
+        assertEquals(1, tx.execute("DELETE FROM users WHERE name = :name", Map.of("name", "Dan")));
         assertEquals(
             0L,
             tx.query("SELECT COUNT(*) FROM users WHERE id = :id", Map.of("id", 4))
@@ -188,15 +187,15 @@ class DriverFeaturesTest {
       Instant before1970 = Instant.parse("1960-01-01T00:00:00.5Z");
       db.execute("INSERT INTO t VALUES ($1, $2)", 1, t);
       db.execute("INSERT INTO t VALUES ($1, $2)", 2, Timestamp.from(t));
-      db.execute("INSERT INTO t VALUES ($1, $2)", 3, OffsetDateTime.ofInstant(t, ZoneOffset.ofHours(3)));
+      db.execute(
+          "INSERT INTO t VALUES ($1, $2)", 3, OffsetDateTime.ofInstant(t, ZoneOffset.ofHours(3)));
       db.execute("INSERT INTO t VALUES ($1, $2)", 4, LocalDateTime.ofInstant(t, ZoneOffset.UTC));
       db.execute("INSERT INTO t VALUES ($1, $2)", 5, before1970);
 
       BulkDecoder.Result r = db.query("SELECT ts FROM t ORDER BY id");
       for (int i = 0; i < 4; i++) assertEquals(t, r.rows().get(i)[0], "row " + (i + 1));
       assertEquals(before1970, r.rows().get(4)[0]);
-      assertEquals(
-          1L, db.query("SELECT COUNT(*) FROM t WHERE ts < $1", t).rows().get(0)[0]);
+      assertEquals(1L, db.query("SELECT COUNT(*) FROM t WHERE ts < $1", t).rows().get(0)[0]);
     }
   }
 
