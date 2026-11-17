@@ -61,7 +61,7 @@ Or pass it on the command line:
 
 ```bash
 java -Djava.library.path=/path/to/stoolap-java/jni/target/release \
-     -cp stoolap-java-0.4.2.jar:your-app.jar \
+     -cp stoolap-java-0.5.0.jar:your-app.jar \
      your.Main
 ```
 
@@ -412,7 +412,7 @@ cargo build --release
 
 ```bash
 mvn clean package
-# Output: target/stoolap-java-0.4.2.jar
+# Output: target/stoolap-java-0.5.0.jar
 ```
 
 ### Shipping prebuilt libraries in the JAR

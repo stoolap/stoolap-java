@@ -76,7 +76,7 @@ public class StoolapDriver implements Driver {
 
   @Override
   public int getMinorVersion() {
-    return 4;
+    return 5;
   }
 
   @Override
