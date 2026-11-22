@@ -42,14 +42,14 @@ Maven:
 <dependency>
     <groupId>io.stoolap</groupId>
     <artifactId>stoolap-java</artifactId>
-    <version>0.5.0</version>
+    <version>0.5.1</version>
 </dependency>
 ```
 
 Gradle:
 
 ```groovy
-implementation 'io.stoolap:stoolap-java:0.5.0'
+implementation 'io.stoolap:stoolap-java:0.5.1'
 ```
 
 Driver 0.5.x runs the Stoolap 0.5 engine. It opens a database written by 0.4.x and moves its files forward on its own, with no way back; read the engine's [v0.4.2 to v0.5.0 migration guide](https://stoolap.io/docs/development/migration-v042-to-v050/) before upgrading.
@@ -86,7 +86,7 @@ Or pass it on the command line:
 
 ```bash
 java -Djava.library.path=/path/to/stoolap-java/jni/target/release \
-     -cp stoolap-java-0.5.0.jar:your-app.jar \
+     -cp stoolap-java-0.5.1.jar:your-app.jar \
      your.Main
 ```
 
@@ -537,7 +537,7 @@ cargo build --release
 
 ```bash
 mvn clean package
-# Output: target/stoolap-java-0.5.0.jar
+# Output: target/stoolap-java-0.5.1.jar
 ```
 
 ### Shipping prebuilt libraries in the JAR
@@ -589,7 +589,7 @@ Enable-Native-Access: ALL-UNNAMED
 
 ### Version skew between Java driver and Rust engine
 
-`jni/Cargo.toml` pins the `stoolap` crate version the driver is built against (0.5.0, without its CLI features). Driver 0.5.x is built for the Stoolap 0.5 engine; rebuild the native library after changing it.
+`jni/Cargo.toml` pins the `stoolap` crate version the driver is built against (0.5.1, without its CLI features). Driver 0.5.x is built for the Stoolap 0.5 engine; rebuild the native library after changing it.
 
 ---
 

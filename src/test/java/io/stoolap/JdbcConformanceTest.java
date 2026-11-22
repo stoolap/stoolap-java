@@ -68,6 +68,22 @@ class JdbcConformanceTest {
   }
 
   @Test
+  void truncateCommitsTheOpenTransactionLikeDdl() throws Exception {
+    // the 0.5.1 engine refuses TRUNCATE inside a transaction
+    try (Connection c = open();
+        Statement s = c.createStatement()) {
+      s.execute("CREATE TABLE a (id INTEGER PRIMARY KEY)");
+      s.executeUpdate("INSERT INTO a VALUES (1)");
+      c.setAutoCommit(false);
+      s.executeUpdate("INSERT INTO a VALUES (2)");
+      s.execute("TRUNCATE TABLE a");
+      s.executeUpdate("INSERT INTO a VALUES (3)");
+      c.rollback();
+      assertEquals(0, count(c, "a"));
+    }
+  }
+
+  @Test
   void catalogStatementsLeaveTheTransactionOpen() throws Exception {
     try (Connection c = open();
         Statement s = c.createStatement()) {
